@@ -26,10 +26,5 @@ export async function enqueueMemoryMaintenanceIfNeeded(
     idempotencyKey: newId("idem")
   };
 
-  if (env.MEMORY_QUEUE) {
-    await env.MEMORY_QUEUE.send(message);
-    return;
-  }
-
   await handleQueueMessage(message, env);
 }

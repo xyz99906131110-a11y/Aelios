@@ -35,6 +35,22 @@ function getTopK(env: Env): number {
   return Number.isFinite(value) ? Math.min(Math.max(value, 1), 50) : 8;
 }
 
+async function searchMemoriesForInjection(
+  env: Env,
+  input: { namespace: string; query: string; topK: number }
+): Promise<MemoryApiRecord[]> {
+  try {
+    return await searchMemories(env, {
+      namespace: input.namespace,
+      query: input.query,
+      topK: input.topK
+    });
+  } catch (error) {
+    console.error("memory injection search failed", error);
+    return [];
+  }
+}
+
 function dedupeMemories(memories: MemoryApiRecord[]): MemoryApiRecord[] {
   const seen = new Set<string>();
   const result: MemoryApiRecord[] = [];
@@ -71,7 +87,7 @@ export async function selectMemoriesForInjection(
   }
 
   const ragMemories = input.query.trim()
-    ? await searchMemories(env, {
+    ? await searchMemoriesForInjection(env, {
         namespace,
         query: input.query,
         topK: getTopK(env)

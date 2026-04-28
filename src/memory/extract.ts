@@ -172,6 +172,10 @@ export async function extractMemoriesFromMessages(
   }
 
   const parsed = (await response.json()) as OpenAIChatResponse;
-  const content = parsed.choices?.[0]?.message?.content;
-  return parseExtraction(typeof content === "string" ? content : "");
+  const message = parsed.choices?.[0]?.message as
+    | ({ content?: unknown; reasoning_content?: unknown })
+    | undefined;
+  const content = typeof message?.content === "string" ? message.content.trim() : "";
+  const reasoning = typeof message?.reasoning_content === "string" ? message.reasoning_content.trim() : "";
+  return parseExtraction(content || reasoning);
 }

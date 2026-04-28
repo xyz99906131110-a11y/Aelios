@@ -196,13 +196,13 @@ export async function searchMemoriesByText(
   db: D1Database,
   input: { namespace: string; query: string; types?: string[]; limit: number }
 ): Promise<Array<MemoryRecord & { score: number }>> {
-  const query = input.query.trim();
-  const like = `%${query}%`;
+  const query = input.query.trim().replace(/\s+/g, " ").slice(0, 500);
+  const like = `%${query.replace(/[\\%_]/g, "\\$&")}%`;
   let sql = "SELECT * FROM memories WHERE namespace = ? AND status = 'active'";
   const binds: unknown[] = [input.namespace];
 
   if (query) {
-    sql += " AND (content LIKE ? OR summary LIKE ? OR tags LIKE ? OR type LIKE ?)";
+    sql += " AND (content LIKE ? ESCAPE '\\' OR summary LIKE ? ESCAPE '\\' OR tags LIKE ? ESCAPE '\\' OR type LIKE ? ESCAPE '\\')";
     binds.push(like, like, like, like);
   }
 
