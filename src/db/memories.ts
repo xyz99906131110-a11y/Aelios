@@ -108,16 +108,10 @@ export async function listMemories(db: D1Database, filters: ListMemoryFilters): 
   sql += " ORDER BY pinned DESC, importance DESC, updated_at DESC LIMIT ?";
   binds.push(filters.limit);
 
-  let result: D1Result<MemoryRecord>;
-  try {
-    result = await db
-      .prepare(sql)
-      .bind(...binds)
-      .all<MemoryRecord>();
-  } catch (error) {
-    console.error("text memory search failed", error);
-    return [];
-  }
+  const result = await db
+    .prepare(sql)
+    .bind(...binds)
+    .all<MemoryRecord>();
 
   return result.results ?? [];
 }
@@ -220,10 +214,16 @@ export async function searchMemoriesByText(
   sql += " ORDER BY pinned DESC, importance DESC, updated_at DESC LIMIT ?";
   binds.push(input.limit);
 
-  const result = await db
-    .prepare(sql)
-    .bind(...binds)
-    .all<MemoryRecord>();
+  let result: D1Result<MemoryRecord>;
+  try {
+    result = await db
+      .prepare(sql)
+      .bind(...binds)
+      .all<MemoryRecord>();
+  } catch (error) {
+    console.error("text memory search failed", error);
+    return [];
+  }
 
   const lowered = query.toLowerCase();
   return (result.results ?? []).map((record) => ({
