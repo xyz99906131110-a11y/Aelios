@@ -41,16 +41,23 @@ Build command: npm ci
 Deploy command: npm run setup:cloudflare && npx wrangler deploy --keep-vars
 ```
 
-在 Cloudflare 的构建配置里，找到 `Variables and Secrets`。现在你只需要新增这些 Text：
+在 Cloudflare 的构建配置里，找到 `Variables and Secrets`。
+
+模型变量会从 `wrangler.toml` 自动出现在 Cloudflare 里，而且很直观，方便你随时看见和修改：
+
+```text
+CHAT_MODEL                主聊天模型，比如 anthropic/claude-sonnet-4-5
+MEMORY_FILTER_MODEL       记忆压缩分拣模型，比如 openai/gpt-4.1-mini
+MEMORY_MODEL              记忆小秘书模型，比如 google-ai-studio/gemini-2.5-flash
+VISION_MODEL              导盲犬视觉模型，比如 openai/gpt-4.1-mini
+```
+
+你只需要自己新增这 3 个 Text：
 
 ```text
 AI_GATEWAY_BASE_URL       普通变量，可以填到 gateway id 或 /compat 结尾
 CHATBOX_API_KEY           Text，自己编一个 sk-xxx
 CF_AIG_TOKEN              Text，你的 Cloudflare AI Gateway token
-CHAT_MODEL                主聊天模型，比如 anthropic/claude-sonnet-4-5
-MEMORY_FILTER_MODEL       记忆压缩分拣模型，比如 openai/gpt-4.1-mini
-MEMORY_MODEL              记忆小秘书模型，比如 google-ai-studio/gemini-2.5-flash
-VISION_MODEL              导盲犬视觉模型，比如 openai/gpt-4.1-mini
 ```
 
 四个模型名分别是：
@@ -62,9 +69,7 @@ MEMORY_MODEL         聊天结束后整理长期记忆的小秘书
 VISION_MODEL         以后处理图片/视觉输入的导盲犬
 ```
 
-如果只看到了 `AI_GATEWAY_BASE_URL`，就点 `Add variable` 自己新增上面这些名字和值。都可以直接 Text。
-
-注意：这些值以 Cloudflare Dashboard 里填的 Text 为准，项目里的 `wrangler.toml` 不再写占位 key，避免部署时把真实值覆盖掉。
+如果模型变量没有出现，点一次重新 Deploy。私有变量不会写在仓库里，所以 `AI_GATEWAY_BASE_URL`、`CHATBOX_API_KEY`、`CF_AIG_TOKEN` 需要你自己加。
 
 向量模型不用填，固定默认 `@cf/google/embeddinggemma-300m`，Vectorize 维度按 768。
 其他开关不用填：Claude 自动路由、Claude cache_control、记忆注入、记忆抽取、Cache API 都自动开。
@@ -107,12 +112,17 @@ cd files-mentioned-by-the-user-companion && npm run setup:cloudflare && npx wran
 
 ## 要填的 Text 变量
 
-Cloudflare 里直接填 Text：
+Cloudflare 里会有 4 个模型 Text，你只需要另外填 3 个私有 Text：
 
 ```text
 AI_GATEWAY_BASE_URL
 CHATBOX_API_KEY
 CF_AIG_TOKEN
+```
+
+模型 Text 默认在 `wrangler.toml`，也会显示在 Cloudflare 里：
+
+```text
 CHAT_MODEL
 MEMORY_FILTER_MODEL
 MEMORY_MODEL

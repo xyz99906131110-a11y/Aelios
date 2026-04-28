@@ -2,8 +2,17 @@ name = "companion-memory-proxy"
 main = "src/index.ts"
 compatibility_date = "2026-04-01"
 
-# Text variables live in the Cloudflare Dashboard. Do not put placeholder
-# keys here, or a deploy can overwrite the real dashboard values.
+[vars]
+# Visible model knobs. These are intentionally in wrangler.toml so they show
+# up in Cloudflare Variables and can be changed without touching code.
+PUBLIC_MODEL_NAME = "companion"
+CHAT_MODEL = "deepseek-v4-pro"
+MEMORY_FILTER_MODEL = "deepseek-v4-pro"
+MEMORY_MODEL = "deepseek-v4-pro"
+VISION_MODEL = "deepseek-v4-pro"
+
+# Private/account-specific variables live in the Cloudflare Dashboard:
+# AI_GATEWAY_BASE_URL, CHATBOX_API_KEY, CF_AIG_TOKEN.
 # D1 binding is auto-filled by `npm run setup:cloudflare`.
 
 [[vectorize]]
