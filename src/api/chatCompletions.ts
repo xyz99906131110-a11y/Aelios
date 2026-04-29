@@ -1,20 +1,25 @@
 import { authenticate } from "../auth/apiKey";
 import { requireScope } from "../auth/scopes";
 import { getOrCreateConversation } from "../db/conversations";
+import { listMemories } from "../db/memories";
 import { saveAssistantMessage, saveUserMessages } from "../db/messages";
 import { saveUsageLog } from "../db/usageLogs";
 import { extractLastUserText, injectMemoryPatchAsSystemMessage, selectMemoriesForInjection } from "../memory/inject";
+import { toMemoryApiRecord } from "../memory/search";
+import { assemble } from "../assembler/assemble";
+import { PERSONA_MEMORY_TYPES } from "../assembler/types";
 import { enqueueMemoryMaintenanceIfNeeded } from "../queue/producer";
 import {
   buildAnthropicNativeRequest,
+  buildAnthropicRequestFromAssembled,
   callAnthropicNative,
   parseAnthropicNonStream
 } from "../proxy/anthropicAdapter";
-import { buildOpenAICompatRequest, callOpenAICompat } from "../proxy/openaiAdapter";
+import { buildOpenAICompatRequest, buildOpenAIRequestFromAssembled, callOpenAICompat } from "../proxy/openaiAdapter";
 import { classifyProvider, resolveTargetModel } from "../proxy/resolveModel";
 import { streamAnthropicToOpenAI } from "../proxy/streamAnthropic";
 import { streamOpenAIWithTee } from "../proxy/streamOpenAI";
-import type { Env, OpenAIChatRequest, OpenAIChatResponse } from "../types";
+import type { Env, MemoryApiRecord, OpenAIChatRequest, OpenAIChatResponse } from "../types";
 import { openAiError } from "../utils/json";
 
 function extractAssistantText(response: OpenAIChatResponse): string {
@@ -30,6 +35,12 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
+export function hasToolContent(body: OpenAIChatRequest): boolean {
+  return body.messages.some(
+    (m) => m.role === "tool" || (m.role === "assistant" && m.tool_calls != null)
+  );
+}
+
 function hasImageContent(body: OpenAIChatRequest): boolean {
   return body.messages.some((message) => {
     if (!Array.isArray(message.content)) return false;
@@ -38,6 +49,26 @@ function hasImageContent(body: OpenAIChatRequest): boolean {
       return part.type === "image_url" || part.type === "input_image";
     });
   });
+}
+
+/**
+ * Fetch pinned memories whose type is "persona" or "identity" from D1.
+ * Returns MemoryApiRecord[] for the assembler's persona_pinned block.
+ * Deterministic sort is applied later by the assembler itself.
+ */
+async function fetchPinnedPersonaMemories(
+  db: D1Database,
+  namespace: string
+): Promise<MemoryApiRecord[]> {
+  const records = await listMemories(db, {
+    namespace,
+    status: "active",
+    limit: 100,
+  });
+
+  return records
+    .filter((r) => r.pinned && PERSONA_MEMORY_TYPES.includes(r.type))
+    .map((r) => toMemoryApiRecord(r));
 }
 
 export async function handleChatCompletions(
@@ -98,20 +129,54 @@ export async function handleChatCompletions(
     query: extractLastUserText(body.messages)
   });
 
+  const pinnedPersonaMemories = await fetchPinnedPersonaMemories(env.DB, auth.profile.namespace);
+
   let upstream: Response;
+  let clientSystemHash: string | null = null;
+  let cacheAnchorBlock: string | null = null;
   try {
     if (provider === "anthropic") {
-      const anthropicRequest = await buildAnthropicNativeRequest(body, {
-        env,
-        targetModel,
-        namespace: auth.profile.namespace,
-        memories
-      });
-      upstream = await callAnthropicNative(env, anthropicRequest);
+      if (hasToolContent(body)) {
+        // Tool messages / tool_calls not yet supported by assembler — fall back
+        const anthropicRequest = await buildAnthropicNativeRequest(body, {
+          env,
+          targetModel,
+          namespace: auth.profile.namespace,
+          memories
+        });
+        upstream = await callAnthropicNative(env, anthropicRequest);
+      } else {
+        const assembled = assemble({
+          request: body,
+          pinnedPersonaMemories,
+          summaryEntry: null,
+          ragMemories: memories,
+          visionOutput: null,
+        });
+        clientSystemHash = assembled.meta.client_system_hash;
+        cacheAnchorBlock = assembled.meta.anchor_index >= 0 ? "client_system" : null;
+        // NOTE: Anthropic adapter stringifies structured content (image_url etc.)
+        // as a temporary fallback; native Anthropic image support will be added
+        // when the vision pipeline is wired in.
+        upstream = await callAnthropicNative(env, buildAnthropicRequestFromAssembled(body, targetModel, assembled, env));
+      }
     } else {
-      const patchedBody = injectMemoryPatchAsSystemMessage(body, memories);
-      const upstreamRequest = buildOpenAICompatRequest(patchedBody, targetModel);
-      upstream = await callOpenAICompat(env, upstreamRequest);
+      if (hasToolContent(body)) {
+        // Tool messages / tool_calls not yet supported by assembler — fall back
+        const patchedBody = injectMemoryPatchAsSystemMessage(body, memories);
+        const upstreamRequest = buildOpenAICompatRequest(patchedBody, targetModel);
+        upstream = await callOpenAICompat(env, upstreamRequest);
+      } else {
+        const assembled = assemble({
+          request: body,
+          pinnedPersonaMemories,
+          summaryEntry: null,
+          ragMemories: memories,
+          visionOutput: null,
+        });
+        clientSystemHash = assembled.meta.client_system_hash;
+        upstream = await callOpenAICompat(env, buildOpenAIRequestFromAssembled(body, targetModel, assembled));
+      }
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : "Failed to call upstream";
@@ -138,7 +203,9 @@ export async function handleChatCompletions(
         fromMessageId: latestUserMessageId,
         requestModel: body.model,
         upstreamModel: targetModel,
-        provider
+        provider,
+        clientSystemHash,
+        cacheAnchorBlock
       });
     }
 
@@ -150,7 +217,9 @@ export async function handleChatCompletions(
       fromMessageId: latestUserMessageId,
       requestModel: body.model,
       upstreamModel: targetModel,
-      provider
+      provider,
+      clientSystemHash,
+      cacheAnchorBlock
     });
   }
 
@@ -189,7 +258,9 @@ export async function handleChatCompletions(
           model: targetModel,
           usage: parsed.usage,
           cacheMode: "anthropic_explicit",
-          cacheTtl: env.ANTHROPIC_CACHE_TTL || "5m"
+          cacheTtl: env.ANTHROPIC_CACHE_TTL || "5m",
+          clientSystemHash,
+          cacheAnchorBlock
         }),
         enqueueMemoryMaintenanceIfNeeded(env, {
           namespace: auth.profile.namespace,
@@ -237,7 +308,9 @@ export async function handleChatCompletions(
         namespace: auth.profile.namespace,
         provider,
         model: targetModel,
-        usage: parsed.usage
+        usage: parsed.usage,
+        clientSystemHash,
+        cacheAnchorBlock
       }),
       enqueueMemoryMaintenanceIfNeeded(env, {
         namespace: auth.profile.namespace,

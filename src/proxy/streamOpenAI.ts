@@ -13,6 +13,8 @@ interface StreamOpenAIOptions {
   requestModel: string;
   upstreamModel: string;
   provider: string;
+  clientSystemHash?: string | null;
+  cacheAnchorBlock?: string | null;
 }
 
 interface StreamState {
@@ -64,7 +66,9 @@ async function persistStreamResult(options: StreamOpenAIOptions, state: StreamSt
     namespace: options.profile.namespace,
     provider: options.provider,
     model: options.upstreamModel,
-    usage: state.usage
+    usage: state.usage,
+    clientSystemHash: options.clientSystemHash ?? null,
+    cacheAnchorBlock: options.cacheAnchorBlock ?? null
   });
 
   await enqueueMemoryMaintenanceIfNeeded(options.env, {

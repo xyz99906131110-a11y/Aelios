@@ -1,5 +1,6 @@
 import { handleHealth } from "./api/health";
 import { handleCache } from "./api/cache";
+import { handleCacheHealth } from "./api/debug";
 import { handleChatCompletions } from "./api/chatCompletions";
 import { handleMemories } from "./api/memories";
 import { handleModels } from "./api/models";
@@ -29,6 +30,10 @@ export default {
 
     if (url.pathname.startsWith("/v1/cache/")) {
       return handleCache(request, env);
+    }
+
+    if (request.method === "GET" && url.pathname === "/v1/debug/cache_health") {
+      return handleCacheHealth(request, env);
     }
 
     return openAiError("Not found", 404);

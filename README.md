@@ -81,6 +81,9 @@ Build command: npm ci
 Deploy command: npm run deploy:cloudflare
 ```
 
+不要把 Deploy command 改成 `npm run deploy` 或 `wrangler deploy`。
+`npm run deploy:cloudflare` 会先准备 D1、Vectorize、Queue，并自动跑数据库升级，再部署 Worker。
+
 ### 4. 填变量
 
 在 Cloudflare 项目的 `Variables and Secrets` 里填这些。
@@ -245,6 +248,7 @@ npm run setup:cloudflare && wrangler deploy --keep-vars
 ```
 
 `--keep-vars` 必须保留，避免 Cloudflare Dashboard 里的模型变量和私有变量被重新部署覆盖。
+`setup:cloudflare` 必须先于 `wrangler deploy` 执行，避免新代码上线时 D1 还没升级。
 
 ### setup 脚本会做什么
 
@@ -463,6 +467,13 @@ curl "https://<worker>/v1/memories/search" \
   -H "Authorization: Bearer <CHATBOX_API_KEY>" \
   -H "content-type: application/json" \
   -d '{ "query": "蓝莓星线-0428", "top_k": 5 }'
+```
+
+Claude cache 健康检查，需要用 `DEBUG_API_KEY`：
+
+```bash
+curl "https://<worker>/v1/debug/cache_health" \
+  -H "Authorization: Bearer <DEBUG_API_KEY>"
 ```
 
 ### 当前已验证

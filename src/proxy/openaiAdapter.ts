@@ -1,3 +1,5 @@
+import type { AssembledPrompt } from "../assembler/types";
+import { assembledToOpenAIChatMessages } from "../assembler/toOpenAI";
 import type { Env, OpenAIChatRequest } from "../types";
 
 export function buildOpenAICompatRequest(req: OpenAIChatRequest, targetModel: string): OpenAIChatRequest {
@@ -6,6 +8,20 @@ export function buildOpenAICompatRequest(req: OpenAIChatRequest, targetModel: st
     model: targetModel,
     stream: Boolean(req.stream)
   };
+}
+
+/**
+ * Build an OpenAI-compatible request from an AssembledPrompt.
+ * System blocks are merged into one system message; conversation messages
+ * (including image_url) are preserved as-is.
+ */
+export function buildOpenAIRequestFromAssembled(
+  req: OpenAIChatRequest,
+  targetModel: string,
+  assembled: AssembledPrompt
+): OpenAIChatRequest {
+  const messages = assembledToOpenAIChatMessages(assembled);
+  return buildOpenAICompatRequest({ ...req, messages }, targetModel);
 }
 
 export function getOpenAICompatUrl(env: Env): string {

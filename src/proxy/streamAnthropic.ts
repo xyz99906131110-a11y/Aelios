@@ -14,6 +14,8 @@ interface StreamAnthropicOptions {
   requestModel: string;
   upstreamModel: string;
   provider: string;
+  clientSystemHash?: string | null;
+  cacheAnchorBlock?: string | null;
 }
 
 interface StreamState {
@@ -105,7 +107,9 @@ async function persistStreamResult(options: StreamAnthropicOptions, state: Strea
     model: options.upstreamModel,
     usage: state.usage,
     cacheMode: "anthropic_explicit",
-    cacheTtl: options.env.ANTHROPIC_CACHE_TTL || "5m"
+    cacheTtl: options.env.ANTHROPIC_CACHE_TTL || "5m",
+    clientSystemHash: options.clientSystemHash ?? null,
+    cacheAnchorBlock: options.cacheAnchorBlock ?? null
   });
 
   await enqueueMemoryMaintenanceIfNeeded(options.env, {

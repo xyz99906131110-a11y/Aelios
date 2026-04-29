@@ -12,6 +12,8 @@ export async function saveUsageLog(
     usage?: TokenUsage;
     cacheMode?: string | null;
     cacheTtl?: string | null;
+    clientSystemHash?: string | null;
+    cacheAnchorBlock?: string | null;
   }
 ): Promise<void> {
   const usage = input.usage || {};
@@ -20,8 +22,8 @@ export async function saveUsageLog(
       `INSERT INTO usage_logs (
         id, message_id, namespace, provider, model, input_tokens,
         output_tokens, cache_read_tokens, cache_creation_tokens, cache_mode,
-        cache_ttl, raw_usage_json, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        cache_ttl, client_system_hash, cache_anchor_block, raw_usage_json, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       newId("usage"),
@@ -35,6 +37,8 @@ export async function saveUsageLog(
       usage.cache_creation_input_tokens ?? null,
       input.cacheMode ?? null,
       input.cacheTtl ?? null,
+      input.clientSystemHash ?? null,
+      input.cacheAnchorBlock ?? null,
       JSON.stringify(usage),
       nowIso()
     )

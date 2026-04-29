@@ -1,4 +1,6 @@
 import { buildStableMemoryPack } from "../memory/stablePack";
+import type { AssembledPrompt } from "../assembler/types";
+import { assembledToAnthropicMessages, assembledToAnthropicSystem } from "../assembler/toAnthropic";
 import type { Env, MemoryApiRecord, OpenAIChatMessage, OpenAIChatRequest, OpenAIChatResponse, TokenUsage } from "../types";
 import { formatMemoryPatch } from "../memory/inject";
 import { normalizeAiGatewayBaseUrl } from "./openaiAdapter";
@@ -153,6 +155,47 @@ export async function buildAnthropicNativeRequest(
     system,
     messages: convertMessages(req.messages)
   };
+}
+
+/**
+ * Build an Anthropic native request from an AssembledPrompt.
+ *
+ * - System blocks are converted via assembledToAnthropicSystem
+ * - Messages via assembledToAnthropicMessages
+ *   (structured content like image_url is JSON.stringify'd — temporary fallback)
+ * - cache_control is applied only to the client_system anchor block,
+ *   respecting ANTHROPIC_CACHE_ENABLED and ANTHROPIC_CACHE_TTL
+ */
+export function buildAnthropicRequestFromAssembled(
+  req: OpenAIChatRequest,
+  targetModel: string,
+  assembled: AssembledPrompt,
+  env: Env
+): AnthropicRequest {
+  const system = assembledToAnthropicSystem(assembled.system_blocks);
+  applyCacheOverrides(system, env);
+
+  return {
+    model: stripAnthropicProviderPrefix(targetModel),
+    max_tokens: getMaxTokens(req),
+    temperature: typeof req.temperature === "number" ? req.temperature : undefined,
+    stream: Boolean(req.stream),
+    system,
+    messages: assembledToAnthropicMessages(assembled.messages),
+  };
+}
+
+function applyCacheOverrides(systemBlocks: AnthropicTextBlock[], env: Env): void {
+  const anchor = systemBlocks.find((b) => b.cache_control);
+  if (!anchor) return;
+
+  if (env.ANTHROPIC_CACHE_ENABLED === "false") {
+    delete anchor.cache_control;
+    return;
+  }
+
+  const ttl = env.ANTHROPIC_CACHE_TTL === "1h" ? "1h" : "5m";
+  anchor.cache_control = { type: "ephemeral", ttl };
 }
 
 export async function callAnthropicNative(env: Env, body: AnthropicRequest): Promise<Response> {
