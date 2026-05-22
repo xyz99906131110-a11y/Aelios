@@ -44,6 +44,7 @@ const BLOCK_ORDER = [
   "long_term_summary",
   "preset_lite",
   "client_system",
+  "client_volatile_context",
   "dynamic_memory_patch",
   "vision_context",
   "recent_history",
@@ -91,6 +92,51 @@ function messageToOutput(msg) {
   if (msg.role !== "user" && msg.role !== "assistant") return null;
   if (!isNonEmptyContent(msg.content)) return null;
   return { role: msg.role, content: msg.content };
+}
+
+function isVolatileTimeLine(line) {
+  const trimmed = line.trim();
+  if (!trimmed) return false;
+  const normalized = trimmed.replace(/^[>*\-\d.)\s]+/, "").trim();
+  const lower = normalized.toLowerCase();
+
+  const hasTimeLabel =
+    /^the\s+current\s+(?:date|time|datetime|timestamp|timezone)\b/.test(lower) ||
+    /^(?:current|today'?s?|now|local|system|request)\s+(?:date|time|datetime|timestamp|timezone)\b/.test(lower) ||
+    /^(?:date|time|datetime|timestamp|timezone)\s*[:：=]/.test(lower) ||
+    /^(?:当前|现在|今日|今天|本日|系统|请求|本地)?(?:日期|时间|日期时间|时间戳|时区)\s*[:：=是为]/.test(normalized) ||
+    /^(?:今天|今日|现在)\s*(?:是|为)/.test(normalized);
+
+  const hasDateLikeValue =
+    /\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b/.test(normalized) ||
+    /\b\d{4}年\d{1,2}月\d{1,2}日/.test(normalized) ||
+    /\b(?:19|20)\d{2}\b/.test(normalized) ||
+    /\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4}\b/i.test(normalized) ||
+    /\b\d{1,2}:\d{2}(?::\d{2})?\b/.test(normalized);
+
+  return hasTimeLabel && (hasDateLikeValue || /\btimezone\b/i.test(normalized) || /时区/.test(normalized));
+}
+
+function splitClientSystemTexts(texts) {
+  const stable = [];
+  const volatile = [];
+
+  for (const text of texts) {
+    const stableLines = [];
+    const volatileLines = [];
+
+    for (const line of text.split(/\r?\n/)) {
+      if (isVolatileTimeLine(line)) volatileLines.push(line.trim());
+      else stableLines.push(line);
+    }
+
+    const stableText = stableLines.join("\n").trim();
+    const volatileText = volatileLines.join("\n").trim();
+    if (stableText) stable.push(stableText);
+    if (volatileText) volatile.push(volatileText);
+  }
+
+  return { stable, volatile };
 }
 
 function assemble(ctx) {
@@ -158,7 +204,22 @@ function assemble(ctx) {
         .filter((m) => m.role === "system")
         .map((m) => (typeof m.content === "string" ? m.content.trim() : ""))
         .filter(Boolean);
-      if (texts.length > 0) text = texts.join("\n\n");
+      const { stable } = splitClientSystemTexts(texts);
+      if (stable.length > 0) text = stable.join("\n\n");
+    } else if (blockId === "client_volatile_context") {
+      const texts = ctx.systemMessages
+        .filter((m) => m.role === "system")
+        .map((m) => (typeof m.content === "string" ? m.content.trim() : ""))
+        .filter(Boolean);
+      const { volatile } = splitClientSystemTexts(texts);
+      if (volatile.length > 0) {
+        text = [
+          "<volatile_context>",
+          "以下是客户端提供的当前时间/日期等本轮上下文，只用于当前回复，不要当作长期设定。",
+          ...volatile,
+          "</volatile_context>",
+        ].join("\n");
+      }
     } else if (blockId === "dynamic_memory_patch") {
       if (ctx.ragMemories.length > 0) {
         const lines = ctx.ragMemories.map(
@@ -426,6 +487,56 @@ check("stable blocks come before client_system, dynamic after", () => {
       assert.ok(pos > csPos, `${id} should come after client_system`);
     }
   }
+});
+
+check("volatile time lines move after client_system without cache_control", () => {
+  const ctx = makeBaseCtx();
+  ctx.systemMessages = [{
+    role: "system",
+    content: [
+      "Current date: Friday, May 22, 2026",
+      "你是稳定角色。",
+      "当前时间：2026-05-22 16:42:00",
+    ].join("\n"),
+  }];
+
+  const result = assemble(ctx);
+  const clientIdx = result.meta.block_ids.indexOf("client_system");
+  const volatileIdx = result.meta.block_ids.indexOf("client_volatile_context");
+
+  assert.ok(clientIdx >= 0, "client_system should remain present");
+  assert.ok(volatileIdx > clientIdx, "volatile context should come after client_system");
+  assert.ok(result.system_blocks[clientIdx].text.includes("你是稳定角色。"));
+  assert.ok(!result.system_blocks[clientIdx].text.includes("2026-05-22"));
+  assert.ok(result.system_blocks[volatileIdx].text.includes("Current date: Friday, May 22, 2026"));
+  assert.ok(result.system_blocks[volatileIdx].text.includes("当前时间：2026-05-22 16:42:00"));
+  assert.strictEqual(result.system_blocks[volatileIdx].cache_control, undefined);
+});
+
+check("client_system_hash ignores changing top-level time variables", () => {
+  const ctx1 = makeBaseCtx();
+  const ctx2 = makeBaseCtx();
+  ctx1.systemMessages = [{
+    role: "system",
+    content: "The current date is Friday, May 22, 2026\n你是稳定角色。",
+  }];
+  ctx2.systemMessages = [{
+    role: "system",
+    content: "The current date is Saturday, May 23, 2026\n你是稳定角色。",
+  }];
+
+  const a = assemble(ctx1);
+  const b = assemble(ctx2);
+
+  assert.strictEqual(a.meta.client_system_hash, b.meta.client_system_hash);
+  assert.strictEqual(
+    a.system_blocks[a.meta.block_ids.indexOf("client_system")].text,
+    b.system_blocks[b.meta.block_ids.indexOf("client_system")].text
+  );
+  assert.notStrictEqual(
+    a.system_blocks[a.meta.block_ids.indexOf("client_volatile_context")].text,
+    b.system_blocks[b.meta.block_ids.indexOf("client_volatile_context")].text
+  );
 });
 
 // ---------------------------------------------------------------------------

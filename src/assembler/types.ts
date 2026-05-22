@@ -80,7 +80,7 @@ export interface AssembledPrompt {
 }
 
 // ---------------------------------------------------------------------------
-// Global block order (9 blocks, single sequence, no PACK)
+// Global block order (10 blocks, single sequence, no PACK)
 // ---------------------------------------------------------------------------
 
 export const BLOCK_ORDER: readonly string[] = [
@@ -89,6 +89,7 @@ export const BLOCK_ORDER: readonly string[] = [
   "long_term_summary",
   "preset_lite",
   "client_system",
+  "client_volatile_context",
   "dynamic_memory_patch",
   "vision_context",
   "recent_history",

@@ -594,7 +594,7 @@ Embedding
 
 ### Prompt Assembler (v4)
 
-组装顺序（9 个 block，单一线性）：
+组装顺序（10 个 block，单一线性）：
 
 ```
 system_blocks:
@@ -602,14 +602,17 @@ system_blocks:
   2. persona_pinned        (stable)  — identity/persona 记忆
   3. long_term_summary     (stable)  — 长期对话摘要（≤2000字）
   4. preset_lite           (stable)  — 输出风格指令
-  5. client_system         (stable)  — 前端 system 消息 [CACHE ANCHOR]
-  6. dynamic_memory_patch  (dynamic) — RAG 命中的记忆
-  7. vision_context        (dynamic) — 视觉描述
+  5. client_system         (stable)  — 前端 system 消息，已拆出明显时间变量 [CACHE ANCHOR]
+  6. client_volatile_context (dynamic) — 前端 system 里的当前日期/时间等本轮变量
+  7. dynamic_memory_patch  (dynamic) — RAG 命中的记忆
+  8. vision_context        (dynamic) — 视觉描述
 
 messages:
-  8. recent_history        — 历史消息（仅 user/assistant）
-  9. current_user          — 当前用户消息（保留原始 content，图片不丢）
+  9. recent_history        — 历史消息（仅 user/assistant）
+ 10. current_user          — 当前用户消息（保留原始 content，图片不丢）
 ```
+
+前端如果把 `Current date: ...`、`当前时间：...` 这类每轮都会变化的内容塞在 system 顶部，assembler 会把这些行拆到 `client_volatile_context`。它仍然会发给模型，但会排在 `client_system` 的显式 cache anchor 后面，避免单个时间变量把稳定角色卡和规则缓存全部打穿。
 
 默认会同时使用三层 Claude prompt cache：
 

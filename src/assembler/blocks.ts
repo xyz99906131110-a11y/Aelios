@@ -1,5 +1,5 @@
 /**
- * 9 block implementations for the v4 Prompt Assembler.
+ * 10 block implementations for the v4 Prompt Assembler.
  *
  * Each block's content_fn must be deterministic: same ctx → same string.
  * No timestamps, no request ids, no Map iteration order.
@@ -184,15 +184,83 @@ function extractSystemTexts(messages: OpenAIChatMessage[]): string[] {
     .filter(Boolean);
 }
 
+function isVolatileTimeLine(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed) return false;
+  const normalized = trimmed.replace(/^[>*\-\d.)\s]+/, "").trim();
+  const lower = normalized.toLowerCase();
+
+  const hasTimeLabel =
+    /^the\s+current\s+(?:date|time|datetime|timestamp|timezone)\b/.test(lower) ||
+    /^(?:current|today'?s?|now|local|system|request)\s+(?:date|time|datetime|timestamp|timezone)\b/.test(lower) ||
+    /^(?:date|time|datetime|timestamp|timezone)\s*[:：=]/.test(lower) ||
+    /^(?:当前|现在|今日|今天|本日|系统|请求|本地)?(?:日期|时间|日期时间|时间戳|时区)\s*[:：=是为]/.test(normalized) ||
+    /^(?:今天|今日|现在)\s*(?:是|为)/.test(normalized);
+
+  const hasDateLikeValue =
+    /\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b/.test(normalized) ||
+    /\b\d{4}年\d{1,2}月\d{1,2}日/.test(normalized) ||
+    /\b(?:19|20)\d{2}\b/.test(normalized) ||
+    /\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4}\b/i.test(normalized) ||
+    /\b\d{1,2}:\d{2}(?::\d{2})?\b/.test(normalized);
+
+  return hasTimeLabel && (hasDateLikeValue || /\btimezone\b/i.test(normalized) || /时区/.test(normalized));
+}
+
+function splitClientSystemTexts(texts: string[]): { stable: string[]; volatile: string[] } {
+  const stable: string[] = [];
+  const volatile: string[] = [];
+
+  for (const text of texts) {
+    const stableLines: string[] = [];
+    const volatileLines: string[] = [];
+
+    for (const line of text.split(/\r?\n/)) {
+      if (isVolatileTimeLine(line)) volatileLines.push(line.trim());
+      else stableLines.push(line);
+    }
+
+    const stableText = stableLines.join("\n").trim();
+    const volatileText = volatileLines.join("\n").trim();
+    if (stableText) stable.push(stableText);
+    if (volatileText) volatile.push(volatileText);
+  }
+
+  return { stable, volatile };
+}
+
 const clientSystemBlock: Block = {
   id: "client_system",
   kind: "stable",
   role: "system",
   cache_anchor: true,
   content_fn: (ctx: AssemblerContext): string | null => {
-    const texts = extractSystemTexts(ctx.systemMessages);
-    if (texts.length === 0) return null;
-    return texts.join("\n\n");
+    const { stable } = splitClientSystemTexts(extractSystemTexts(ctx.systemMessages));
+    if (stable.length === 0) return null;
+    return stable.join("\n\n");
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Block 5.5: client_volatile_context (dynamic)
+// Frontend time/date lines split out of client_system so they do not poison
+// the stable Claude prompt-cache anchor.
+// ---------------------------------------------------------------------------
+
+const clientVolatileContextBlock: Block = {
+  id: "client_volatile_context",
+  kind: "dynamic",
+  role: "system",
+  cache_anchor: false,
+  content_fn: (ctx: AssemblerContext): string | null => {
+    const { volatile } = splitClientSystemTexts(extractSystemTexts(ctx.systemMessages));
+    if (volatile.length === 0) return null;
+    return [
+      "<volatile_context>",
+      "以下是客户端提供的当前时间/日期等本轮上下文，只用于当前回复，不要当作长期设定。",
+      ...volatile,
+      "</volatile_context>",
+    ].join("\n");
   },
 };
 
@@ -283,6 +351,7 @@ const BLOCK_MAP = new Map<string, Block>([
   [longTermSummaryBlock.id, longTermSummaryBlock],
   [presetLiteBlock.id, presetLiteBlock],
   [clientSystemBlock.id, clientSystemBlock],
+  [clientVolatileContextBlock.id, clientVolatileContextBlock],
   [dynamicMemoryPatchBlock.id, dynamicMemoryPatchBlock],
   [visionContextBlock.id, visionContextBlock],
   [recentHistoryBlock.id, recentHistoryBlock],
