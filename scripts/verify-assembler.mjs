@@ -1448,12 +1448,23 @@ function buildAutomaticCacheControl(env) {
   return buildCacheControl(env);
 }
 
+function getRollingCacheWindowSize(env) {
+  const value = Number(env.ANTHROPIC_ROLLING_CACHE_WINDOW_SIZE || 20);
+  if (!Number.isFinite(value)) return 20;
+  return Math.max(Math.floor(value), 1);
+}
+
 function applyRollingMessageCache(messages, env) {
   const cacheControl = buildCacheControl(env);
   if (!cacheControl) return;
   if (env.ANTHROPIC_ROLLING_CACHE_ENABLED === "false") return;
 
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
+  const isFullWindow = messages.length >= getRollingCacheWindowSize(env);
+  const start = isFullWindow ? 0 : messages.length - 1;
+  const end = isFullWindow ? messages.length : -1;
+  const step = isFullWindow ? 1 : -1;
+
+  for (let i = start; i !== end; i += step) {
     const message = messages[i];
     if (message.role !== "user" || message.content.length === 0) continue;
     message.content[message.content.length - 1].cache_control = cacheControl;
@@ -1564,6 +1575,32 @@ check("Anthropic helper: rolling cache_control lands on latest user message", ()
   const lastUser = [...req.messages].reverse().find((m) => m.role === "user");
   const lastBlock = lastUser.content[lastUser.content.length - 1];
   assert.deepStrictEqual(lastBlock.cache_control, { type: "ephemeral" });
+});
+
+check("Anthropic helper: full rolling window restarts cache on first user message", () => {
+  const ctx = makeBaseCtx();
+  ctx.historyMessages = [
+    { role: "assistant", content: "窗口前的助手消息" },
+    { role: "user", content: "窗口第一条用户消息" },
+    { role: "assistant", content: "回复一" },
+  ];
+  ctx.currentUserMessage = { role: "user", content: "窗口最新用户消息" };
+  const assembled = assemble(ctx);
+  const req = buildAnthropicRequestFromAssembled(
+    { messages: [] },
+    "anthropic/claude-sonnet-4-6",
+    assembled,
+    { ANTHROPIC_ROLLING_CACHE_WINDOW_SIZE: "4" }
+  );
+
+  const firstUser = req.messages.find((m) => m.role === "user");
+  const firstUserBlock = firstUser.content[firstUser.content.length - 1];
+  const lastUser = [...req.messages].reverse().find((m) => m.role === "user");
+  const lastUserBlock = lastUser.content[lastUser.content.length - 1];
+
+  assert.strictEqual(firstUser.content[0].text, "窗口第一条用户消息");
+  assert.deepStrictEqual(firstUserBlock.cache_control, { type: "ephemeral" });
+  assert.strictEqual(lastUserBlock.cache_control, undefined);
 });
 
 check("Anthropic helper: ANTHROPIC_CACHE_ENABLED=false removes cache_control", () => {

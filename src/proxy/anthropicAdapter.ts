@@ -85,6 +85,12 @@ function buildAutomaticCacheControl(env: Env): AnthropicRequest["cache_control"]
   return buildCacheControl(env);
 }
 
+function getRollingCacheWindowSize(env: Env): number {
+  const value = Number(env.ANTHROPIC_ROLLING_CACHE_WINDOW_SIZE || 20);
+  if (!Number.isFinite(value)) return 20;
+  return Math.max(Math.floor(value), 1);
+}
+
 export function getAnthropicCacheMode(env: Env): string | null {
   if (env.ANTHROPIC_CACHE_ENABLED === "false") return null;
   const parts = ["anthropic"];
@@ -99,7 +105,12 @@ function applyRollingMessageCache(messages: AnthropicMessage[], env: Env): void 
   if (!cacheControl) return;
   if (env.ANTHROPIC_ROLLING_CACHE_ENABLED === "false") return;
 
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
+  const isFullWindow = messages.length >= getRollingCacheWindowSize(env);
+  const start = isFullWindow ? 0 : messages.length - 1;
+  const end = isFullWindow ? messages.length : -1;
+  const step = isFullWindow ? 1 : -1;
+
+  for (let i = start; i !== end; i += step) {
     const message = messages[i];
     if (message.role !== "user" || message.content.length === 0) continue;
     message.content[message.content.length - 1].cache_control = cacheControl;

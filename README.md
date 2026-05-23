@@ -341,7 +341,8 @@ Model:      companion
 | `ANTHROPIC_CACHE_TTL` | `5m` | Prompt cache 时长（`5m` 或 `1h`） |
 | `ANTHROPIC_CACHE_ENABLED` | `true` | 设 `false` 关闭 cache |
 | `ANTHROPIC_AUTO_CACHE_ENABLED` | `true` | 开启 Anthropic 顶层自动缓存，让多轮历史像 Claude Code 一样向后滚动缓存 |
-| `ANTHROPIC_ROLLING_CACHE_ENABLED` | `true` | 在最后一条 user 内容上显式打 cache_control。部分中转不支持 automatic 时，这个更接近 Claude Code |
+| `ANTHROPIC_ROLLING_CACHE_ENABLED` | `true` | 显式滚动 cache 打点。未满窗口时打在最后一条 user；达到窗口上限后打在当前窗口第一条 user，相当于从新窗口开头重新建缓存段 |
+| `ANTHROPIC_ROLLING_CACHE_WINDOW_SIZE` | `20` | 前端保留的历史窗口大小。Chatbox 日志里 `historyCount=20` 时可保持默认 |
 | `FORCE_ANTHROPIC_NATIVE` | 空 | 设 `true` 强制所有模型走 Anthropic native |
 | `CUSTOM_ANTHROPIC_MESSAGES_PATH` | `messages` | custom Claude 的原生 messages 路径 |
 
@@ -618,9 +619,9 @@ messages:
 
 - 顶层 automatic `cache_control`：Anthropic 会自动把缓存断点放到最后一个可缓存 block，并随着多轮历史增长向后推进。这更接近 Claude Code 的命中形态。
 - 显式 `cache_control`：仍然落在 client_system（block 5），保证前面的 stable blocks 有独立缓存。
-- 滚动显式 `cache_control`：额外落在最后一条 user 内容上。实测部分中转会忽略顶层 automatic，但支持这个显式断点，命中形态会变成 `input` 很小、`cache_read` 随历史增长、`cache_creation` 写入新增段。
+- 滚动显式 `cache_control`：未满历史窗口时额外落在最后一条 user 内容上；达到 `ANTHROPIC_ROLLING_CACHE_WINDOW_SIZE` 后，改落在当前窗口第一条 user 内容上，让被前端截断后的新窗口从开头重新建立缓存段。
 
-如果发现动态记忆每轮变化太大，导致 system 层频繁失效，可以优先减少 RAG 注入内容，或把 `ANTHROPIC_AUTO_CACHE_ENABLED=false` 退回只缓存稳定 system 的模式。
+动态记忆 `dynamic_memory_patch` 排在 `client_system` cache anchor 后面，本身不带显式 `cache_control`；稳定角色卡、摘要、固定规则优先由 `client_system` 这个断点保护。
 
 tool/tool_calls 请求 fallback 到旧路径，assembler 不处理 tool。
 
