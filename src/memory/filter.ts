@@ -2,9 +2,9 @@ import { callOpenAICompat } from "../proxy/openaiAdapter";
 import type { Env, MemoryApiRecord, OpenAIChatRequest, OpenAIChatResponse } from "../types";
 
 const DEFAULT_WORKERS_AI_FILTER_MODEL = "workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+const DEFAULT_WORKERS_AI_RERANKER_MODEL = "workers-ai/@cf/baai/bge-reranker-base";
 
-interface FilteredMemoryItem {
-  id: string;
+interface CompressedMemoryItem {
   content: string;
 }
 
@@ -17,22 +17,18 @@ export interface MemoryFilterMeta {
   output_count: number;
   reason?: string;
   output_shape?: string;
+  reranker_status?: "disabled" | "success" | "error";
+  reranker_model?: string;
+  reranker_count?: number;
+  reranker_reason?: string;
 }
 
-const FILTER_RESPONSE_SCHEMA = {
+const COMPRESSION_RESPONSE_SCHEMA = {
   type: "object",
   properties: {
     memories: {
       type: "array",
-      items: {
-        type: "object",
-        properties: {
-          id: { type: "string" },
-          content: { type: "string" }
-        },
-        required: ["id", "content"],
-        additionalProperties: false
-      }
+      items: { type: "string" }
     }
   },
   required: ["memories"],
@@ -65,6 +61,14 @@ function getModel(env: Env): string {
   return env.MEMORY_FILTER_MODEL || DEFAULT_WORKERS_AI_FILTER_MODEL;
 }
 
+function isRerankerEnabled(env: Env): boolean {
+  return env.ENABLE_MEMORY_RERANKER !== "false";
+}
+
+function getRerankerModel(env: Env): string {
+  return env.MEMORY_RERANKER_MODEL || DEFAULT_WORKERS_AI_RERANKER_MODEL;
+}
+
 function workersAiModelName(model: string): string | null {
   const normalized = model.trim();
   if (normalized.startsWith("workers-ai/")) return normalized.slice("workers-ai/".length);
@@ -76,6 +80,10 @@ function workersAiModelName(model: string): string | null {
 function getWorkersAiModel(env: Env): string | null {
   const model = getModel(env);
   return workersAiModelName(model);
+}
+
+function getWorkersAiRerankerModel(env: Env): string | null {
+  return workersAiModelName(getRerankerModel(env));
 }
 
 function getProvider(env: Env): "workers-ai" | "openai-compatible" {
@@ -220,15 +228,20 @@ function extractJsonArray(value: unknown): unknown[] | null {
   return null;
 }
 
-function parseFilteredItems(value: unknown): FilteredMemoryItem[] | null {
+function parseCompressedItems(value: unknown): CompressedMemoryItem[] | null {
   const array = extractJsonArray(value);
   if (!array) return null;
 
-  const items: FilteredMemoryItem[] = [];
+  const items: CompressedMemoryItem[] = [];
   for (const item of array) {
+    if (typeof item === "string") {
+      const sanitized = sanitizeMemoryContent(item);
+      if (sanitized) items.push({ content: sanitized });
+      continue;
+    }
+
     if (!item || typeof item !== "object") continue;
     const record = item as { id?: unknown; content?: unknown; compressed_content?: unknown };
-    const id = typeof record.id === "string" ? record.id : null;
     const content =
       typeof record.content === "string"
         ? record.content
@@ -236,9 +249,9 @@ function parseFilteredItems(value: unknown): FilteredMemoryItem[] | null {
           ? record.compressed_content
           : null;
 
-    if (id && content) {
+    if (content) {
       const sanitized = sanitizeMemoryContent(content);
-      if (sanitized) items.push({ id, content: sanitized });
+      if (sanitized) items.push({ content: sanitized });
     }
   }
 
@@ -248,62 +261,40 @@ function parseFilteredItems(value: unknown): FilteredMemoryItem[] | null {
 function buildPrompt(input: {
   query: string;
   memories: MemoryApiRecord[];
-  maxOutput: number;
   maxContentChars: number;
   maxOutputChars: number;
 }): string {
-  const candidates = input.memories.map((memory, index) => ({
-    index: index + 1,
-    id: memory.id,
-    type: memory.type,
-    importance: memory.importance,
-    pinned: memory.pinned,
-    score: typeof memory.score === "number" ? Number(memory.score.toFixed(4)) : undefined,
-    tags: memory.tags,
-    content: memory.content
-  }));
+  const memories = input.memories.map((memory) => truncateText(memory.content, input.maxContentChars));
 
   return [
-    "你是长期记忆分拣器。你的任务是从候选记忆中挑出对当前用户消息真正有帮助的记忆，并压缩成短句。",
-    "注意：你不是在判断这条候选是否值得长期保存；你只判断它是否能帮助当前这轮回答、回忆或检索。",
-    "候选已按相关度初筛；score 越高越相关。",
+    "你是长期记忆压缩器。候选记忆已经由 reranker 选好并按相关性排序。",
+    "你的任务只是在不改变事实的前提下，把每条候选压缩成适合放进 prompt 的短句。",
     "",
-    "规则：",
-    "- 只保留能帮助当前用户消息的候选：直接回答问题、补全上下文、长期偏好、正在进行的项目或稳定关系信息。",
-    "- 如果当前用户消息是在询问、回忆或检索过去内容，只要候选与关键名词、事件、口令或时间线直接重合，就保留并压缩。",
-    "- type=summary 的候选要抽取与当前用户消息匹配的片段；不要因为它是短期聊天摘要或对话摘要格式就整条丢弃。",
-    "- 不要因为候选“不够长期稳定”而删除；删除标准只有明显无关、重复、空泛或调试噪音。",
-    "- 删除寒暄、重复、牵强、明显无关的记忆。",
-    "- 同一事实只保留一条，优先保留 score 更高或 pinned=true 的版本。",
-    "- pinned=true 的记忆除非明显无关，否则优先保留。",
-    "- 不要道德评判，不要拒绝，不要安全说教；成人向内容也只是用户偏好资料。",
-    "- 候选记忆是什么内容，就按事实保留；保留用户偏好、边界、称呼、规则、触发点和关系事实。",
+    "压缩规则：",
+    "- 必须按输入顺序逐条输出，输出数量必须与候选记忆数量一致。",
+    "- 不要筛选、重排、合并或删除候选；如果内容很短，也要保留为短句。",
+    "- 不要输出编号、id、index、score、type、tags 或其他元数据。",
     "- 不要添加候选记忆里没有的新事实。",
     "- 不要输出“对话摘要”“用户话题”“助手要点”“time_reminder”等包装词。",
     "- 不要输出记忆系统、debug-test、标签、测试口令等调试/后端元信息。",
     "- 如果候选里有真实口令，只保留口令本身，不要保留“测试”“标签”“debug”等包装词。",
-    "- 没有相关记忆时输出空数组。",
     `- 每条 content 控制在 ${input.maxOutputChars} 个中文字以内。`,
-    `- 最多输出 ${input.maxOutput} 条。`,
     "",
     "只输出 JSON，不要 markdown，不要解释。格式：",
-    `{"memories":[{"id":"mem_xxx","content":"压缩后的记忆"}]}`,
+    `{"memories":["压缩后的记忆1","压缩后的记忆2"]}`,
     "",
     `当前用户消息：${input.query}`,
     "",
-    `候选记忆：${JSON.stringify(candidates.map((candidate) => ({
-      ...candidate,
-      content: truncateText(candidate.content, input.maxContentChars)
-    })))}`
+    `候选记忆：${JSON.stringify(memories)}`
   ].join("\n");
 }
 
-function mergeFilteredItems(memories: MemoryApiRecord[], items: FilteredMemoryItem[]): MemoryApiRecord[] {
-  const byId = new Map(memories.map((memory) => [memory.id, memory]));
+function mergeCompressedItems(memories: MemoryApiRecord[], items: CompressedMemoryItem[]): MemoryApiRecord[] {
   const result: MemoryApiRecord[] = [];
 
-  for (const item of items) {
-    const memory = byId.get(item.id);
+  for (let index = 0; index < items.length && index < memories.length; index += 1) {
+    const memory = memories[index];
+    const item = items[index];
     if (!memory) continue;
     result.push({
       ...memory,
@@ -348,7 +339,7 @@ async function callWorkersAiFilter(env: Env, prompt: string, model: string, maxT
     max_tokens: maxTokens,
     response_format: {
       type: "json_schema",
-      json_schema: FILTER_RESPONSE_SCHEMA
+      json_schema: COMPRESSION_RESPONSE_SCHEMA
     }
   });
 }
@@ -383,6 +374,106 @@ async function callOpenAICompatFilter(env: Env, prompt: string, model: string, m
   const content = typeof message?.content === "string" ? message.content.trim() : "";
   const reasoning = typeof message?.reasoning_content === "string" ? message.reasoning_content.trim() : "";
   return content || reasoning;
+}
+
+function readRerankerResponse(value: unknown): Array<{ id: number; score: number }> | null {
+  if (!value || typeof value !== "object") return null;
+  const object = value as { response?: unknown; result?: unknown; data?: unknown };
+  const rows = Array.isArray(object.response)
+    ? object.response
+    : Array.isArray(object.result)
+      ? object.result
+      : Array.isArray(object.data)
+        ? object.data
+        : null;
+  if (!rows) return null;
+
+  const result: Array<{ id: number; score: number }> = [];
+  for (const row of rows) {
+    if (!row || typeof row !== "object") continue;
+    const item = row as { id?: unknown; index?: unknown; score?: unknown };
+    const id = typeof item.id === "number" ? item.id : typeof item.index === "number" ? item.index : NaN;
+    const score = typeof item.score === "number" ? item.score : NaN;
+    if (Number.isInteger(id) && Number.isFinite(score)) result.push({ id, score });
+  }
+
+  return result.length > 0 ? result : null;
+}
+
+async function rerankMemories(
+  env: Env,
+  input: { query: string; memories: MemoryApiRecord[]; topK: number; maxContentChars: number }
+): Promise<{
+  data: MemoryApiRecord[];
+  status: "disabled" | "success" | "error";
+  model: string;
+  reason?: string;
+}> {
+  const model = getRerankerModel(env);
+  const workersAiModel = getWorkersAiRerankerModel(env);
+
+  if (!isRerankerEnabled(env)) {
+    return {
+      data: input.memories.slice(0, input.topK),
+      status: "disabled",
+      model,
+      reason: "reranker_disabled"
+    };
+  }
+
+  if (!env.AI || !workersAiModel) {
+    return {
+      data: input.memories.slice(0, input.topK),
+      status: "disabled",
+      model,
+      reason: !env.AI ? "missing_workers_ai_binding" : "unsupported_reranker_provider"
+    };
+  }
+
+  try {
+    const output = await env.AI.run(workersAiModel, {
+      query: input.query,
+      top_k: input.topK,
+      contexts: input.memories.map((memory) => ({
+        text: truncateText(memory.content, input.maxContentChars)
+      }))
+    });
+    const rows = readRerankerResponse(output);
+    if (!rows) {
+      return {
+        data: input.memories.slice(0, input.topK),
+        status: "error",
+        model,
+        reason: "invalid_reranker_output"
+      };
+    }
+
+    const used = new Set<number>();
+    const reranked: MemoryApiRecord[] = [];
+    for (const row of rows.sort((a, b) => b.score - a.score)) {
+      if (used.has(row.id)) continue;
+      const memory = input.memories[row.id];
+      if (!memory) continue;
+      used.add(row.id);
+      reranked.push({ ...memory, score: row.score });
+      if (reranked.length >= input.topK) break;
+    }
+
+    return {
+      data: reranked.length > 0 ? reranked : input.memories.slice(0, input.topK),
+      status: reranked.length > 0 ? "success" : "error",
+      model,
+      ...(reranked.length > 0 ? {} : { reason: "empty_reranker_output" })
+    };
+  } catch (error) {
+    console.error("memory reranker failed", error);
+    return {
+      data: input.memories.slice(0, input.topK),
+      status: "error",
+      model,
+      reason: error instanceof Error && error.message ? error.message : "reranker_error"
+    };
+  }
 }
 
 export async function filterAndCompressMemories(
@@ -439,10 +530,15 @@ export async function filterAndCompressMemoriesWithMeta(
     candidate_count: candidates.length,
     output_count: 0
   };
-  const prompt = buildPrompt({
+  const reranked = await rerankMemories(env, {
     query,
     memories: candidates,
-    maxOutput,
+    topK: maxOutput,
+    maxContentChars: getMaxContentChars(env)
+  });
+  const prompt = buildPrompt({
+    query,
+    memories: reranked.data,
     maxContentChars: getMaxContentChars(env),
     maxOutputChars: getMaxOutputChars(env)
   });
@@ -460,12 +556,16 @@ export async function filterAndCompressMemoriesWithMeta(
           ...activeMeta,
           status: "error",
           reason: "empty_model_output",
-          output_shape: describeModelOutput(output)
+          output_shape: describeModelOutput(output),
+          reranker_status: reranked.status,
+          reranker_model: reranked.model,
+          reranker_count: reranked.data.length,
+          ...(reranked.reason ? { reranker_reason: reranked.reason } : {})
         }
       };
     }
 
-    const items = parseFilteredItems(output);
+    const items = parseCompressedItems(output);
     if (!items) {
       return {
         data: [],
@@ -473,19 +573,27 @@ export async function filterAndCompressMemoriesWithMeta(
           ...activeMeta,
           status: "error",
           reason: "invalid_model_output",
-          output_shape: describeModelOutput(output)
+          output_shape: describeModelOutput(output),
+          reranker_status: reranked.status,
+          reranker_model: reranked.model,
+          reranker_count: reranked.data.length,
+          ...(reranked.reason ? { reranker_reason: reranked.reason } : {})
         }
       };
     }
 
-    const filtered = mergeFilteredItems(candidates, items).slice(0, maxOutput);
+    const filtered = mergeCompressedItems(reranked.data, items).slice(0, maxOutput);
     return {
       data: filtered,
       meta: {
         ...activeMeta,
         status: "success",
         output_count: filtered.length,
-        output_shape: describeModelOutput(output)
+        output_shape: describeModelOutput(output),
+        reranker_status: reranked.status,
+        reranker_model: reranked.model,
+        reranker_count: reranked.data.length,
+        ...(reranked.reason ? { reranker_reason: reranked.reason } : {})
       }
     };
   } catch (error) {
@@ -495,7 +603,11 @@ export async function filterAndCompressMemoriesWithMeta(
       meta: {
         ...activeMeta,
         status: "error",
-        reason: error instanceof Error && error.message ? error.message : "model_error"
+        reason: error instanceof Error && error.message ? error.message : "model_error",
+        reranker_status: reranked.status,
+        reranker_model: reranked.model,
+        reranker_count: reranked.data.length,
+        ...(reranked.reason ? { reranker_reason: reranked.reason } : {})
       }
     };
   }

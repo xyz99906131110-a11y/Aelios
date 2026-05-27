@@ -22,7 +22,7 @@ Aelios 是一个跑在 Cloudflare Workers 上的 AI 记忆系统。你把 Chatbo
 
 - `/v1/chat/completions`：像 OpenAI API 一样聊天。
 - 自动长期记忆注入：每轮聊天前从 Vectorize 找相关记忆。
-- 记忆小秘书：搜索后分拣、压缩、去重，只把有用的记忆塞回上下文。
+- 记忆处理：搜索后由 reranker 重排，压缩模型只负责把选中的记忆压短，再塞回上下文。
 - 每日整理：原始聊天先存 D1，凌晨统一整理成摘要、重要原文和少量长期记忆。
 - Claude prompt cache：尽量复用稳定上下文，降低重复输入成本。
 - 图片自动走视觉模型。
@@ -42,7 +42,7 @@ Aelios 是一个跑在 Cloudflare Workers 上的 AI 记忆系统。你把 Chatbo
 
 这份教程分两档：
 
-1. **最小记忆库可用版**：可以写入、搜索、编辑、删除长期记忆；默认 embedding 和记忆筛选小秘书都走 Cloudflare Workers AI。
+1. **最小记忆库可用版**：可以写入、搜索、编辑、删除长期记忆；默认 embedding、reranker 和记忆压缩都走 Cloudflare Workers AI。
 2. **完整版聊天网关**：可以接 Chatbox、Cherry Studio、网页前端、IM bot 等 OpenAI-compatible 客户端，让聊天自动注入记忆。
 
 ### 第一步：Fork 项目
@@ -138,10 +138,11 @@ https://companion-memory-proxy.<你的子域>.workers.dev
 
 到这里，**记忆库功能其实已经能用了**。
 
-因为默认的 embedding 和记忆筛选小秘书都走 Cloudflare Workers AI：
+因为默认的 embedding、记忆 reranker 和记忆压缩小秘书都走 Cloudflare Workers AI：
 
 ```
 EMBEDDING_MODEL = workers-ai/@cf/google/embeddinggemma-300m
+MEMORY_RERANKER_MODEL = workers-ai/@cf/baai/bge-reranker-base
 MEMORY_FILTER_MODEL = workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast
 ```
 
@@ -308,7 +309,7 @@ Model:      companion
 | `CLOUDFLARE_API_TOKEN` | Cloudflare API Token，用于 setup、Vectorize list/get/delete |
 | `CHATBOX_API_KEY` | 客户端和管理面板连接密码 |
 
-只用记忆库时，默认 embedding 和记忆筛选小秘书都走 Workers AI，不需要先配置 AI Gateway。
+只用记忆库时，默认 embedding、reranker 和记忆压缩都走 Workers AI，不需要先配置 AI Gateway。
 
 **完整版聊天网关再填：**
 
@@ -322,11 +323,13 @@ Model:      companion
 | 变量名 | 默认值 | 说明 |
 |--------|--------|------|
 | `CHAT_MODEL` | `deepseek/deepseek-v4-pro` | 主聊天 |
-| `MEMORY_FILTER_MODEL` | `workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast` | 记忆筛选，默认走 Workers AI；也兼容把 JSON 放进 reasoning_content 的模型 |
-| `MEMORY_FILTER_MAX_CANDIDATES` | `12` | 进入小秘书的候选记忆上限 |
-| `MEMORY_FILTER_MAX_OUTPUT` | `4` | 小秘书最终返回记忆上限 |
-| `MEMORY_FILTER_OUTPUT_CHARS` | `300` | 小秘书每条返回内容最多多少字 |
-| `MEMORY_FILTER_MAX_TOKENS` | `1400` | 小秘书 JSON 输出上限，避免多条压缩结果被截断 |
+| `MEMORY_RERANKER_MODEL` | `workers-ai/@cf/baai/bge-reranker-base` | 向量召回后的 reranker，负责按当前消息重排候选记忆 |
+| `ENABLE_MEMORY_RERANKER` | `true` | 设 `false` 跳过 reranker，直接按向量分数进入压缩 |
+| `MEMORY_FILTER_MODEL` | `workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast` | 记忆压缩模型，只负责把 reranker 选出的记忆压短 |
+| `MEMORY_FILTER_MAX_CANDIDATES` | `12` | 进入 reranker 的候选记忆上限 |
+| `MEMORY_FILTER_MAX_OUTPUT` | `4` | reranker 选出并交给压缩模型的记忆上限 |
+| `MEMORY_FILTER_OUTPUT_CHARS` | `300` | 压缩模型每条返回内容最多多少字 |
+| `MEMORY_FILTER_MAX_TOKENS` | `1400` | 压缩模型 JSON 输出上限，避免多条压缩结果被截断 |
 | `SUMMARY_MODEL` | `deepseek/deepseek-v4-pro` | 每日整理小秘书，负责把 D1 临时聊天整理入长期记忆 |
 | `VISION_MODEL` | `google-ai-studio/gemini-3-flash-preview` | 看图；普通聊天和导盲犬 API 都用它 |
 | `EMBEDDING_MODEL` | `workers-ai/@cf/google/embeddinggemma-300m` | 向量嵌入，默认走 Workers AI |
@@ -354,8 +357,8 @@ Model:      companion
 | `DEBUG_API_KEY` | 空 | 调试接口钥匙 |
 | `MEMORY_TOP_K` | `12` | 记忆搜索返回条数 |
 | `MEMORY_MIN_SCORE` | `0.35` | 记忆搜索最低相关度 |
-| `MEMORY_FILTER_MIN_SCORE` | `0.35` | 进入小秘书前的最低相关度；不填时跟随 `MEMORY_MIN_SCORE` |
-| `MEMORY_FILTER_MAX_CONTENT_CHARS` | `700` | 交给小秘书前，每条候选最多保留多少字 |
+| `MEMORY_FILTER_MIN_SCORE` | `0.35` | 进入 reranker 前的最低向量相关度；不填时跟随 `MEMORY_MIN_SCORE` |
+| `MEMORY_FILTER_MAX_CONTENT_CHARS` | `700` | 交给 reranker/压缩模型前，每条候选最多保留多少字 |
 | `MEMORY_MIN_IMPORTANCE` | `0.55` | 记忆写入最低重要性 |
 | `MEMORY_BACKEND` | `vectorize` | 长期记忆主库。默认 Vectorize；设 `d1` 可回到旧模式 |
 | `VECTORIZE_INDEX_NAME` | `memo-kb` | Vectorize 索引名，给 list-vectors API 使用 |
@@ -506,7 +509,7 @@ POST /v1/memory/search
 POST /v1/search/memories
 ```
 
-默认走 Vectorize 搜索，再用记忆小秘书分拣压缩。想要最低延迟时传 `filter: false`，只返回原始向量命中；想直接拿一段可塞进 prompt 的文本时传 `include_prompt: true`。
+默认走 Vectorize 搜索，再用 reranker 重排，最后让记忆压缩小秘书只负责压缩。想要最低延迟时传 `filter: false`，只返回原始向量命中；想直接拿一段可塞进 prompt 的文本时传 `include_prompt: true`。
 
 简单说：`/v1/memory/search` 是给模型召回用的，可能被小秘书加工；`/v1/memory/:id` 和列表/创建/修改/删除是给人或脚本管理原始记忆库用的。
 
@@ -561,7 +564,7 @@ Dimensions:  768 (如覆盖 EMBEDDING_MODEL，输出维度仍需匹配)
 
 ### 模型路由
 
-聊天和非 Workers AI 模型调用走 Cloudflare AI Gateway。`workers-ai/`、`worker/`、`@cf/` 前缀的筛选和 embedding 会直接走 Worker 的 Workers AI binding。
+聊天和非 Workers AI 模型调用走 Cloudflare AI Gateway。`workers-ai/`、`worker/`、`@cf/` 前缀的 embedding、reranker 和压缩模型会直接走 Worker 的 Workers AI binding。
 
 ```
 用户传 model=companion
@@ -650,7 +653,8 @@ dash_to_comma:      —、——、– 改成 ，
   -> Vectorize 搜索 memo-kb（长期记忆主库）
   -> 从 Vectorize metadata 读取 content/type/tags/importance/status
   -> 分数过滤 + 去重 + 截断候选
-  -> MEMORY_FILTER_MODEL 用 JSON mode 分拣压缩
+  -> MEMORY_RERANKER_MODEL 重排候选
+  -> MEMORY_FILTER_MODEL 用 JSON mode 压缩 reranker 选中的记忆
   -> 注入 dynamic_memory_patch
   -> pinned identity/persona -> persona_pinned block
 ```
