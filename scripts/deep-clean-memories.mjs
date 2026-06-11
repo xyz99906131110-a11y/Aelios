@@ -19,11 +19,14 @@ const batchSize = readArgNumber("--batch-size", Number(process.env.CLEANUP_BATCH
 const maxBatches = readArgNumber("--limit-batches", Infinity);
 const modelTimeoutMs = Number(process.env.CLEANUP_MODEL_TIMEOUT_MS || 120000);
 const modelMaxTokens = Number(process.env.CLEANUP_MODEL_MAX_TOKENS || 6000);
-const cleanupConcurrency = Math.max(1, Math.min(4, Number(process.env.CLEANUP_CONCURRENCY || 1)));
+const cleanupConcurrency = Math.max(1, Math.min(8, Number(process.env.CLEANUP_CONCURRENCY || 1)));
+const applyConcurrency = Math.max(1, Math.min(8, Number(process.env.CLEANUP_APPLY_CONCURRENCY || cleanupConcurrency)));
 const batchDelayMs = Number(process.env.CLEANUP_BATCH_DELAY_MS || 1500);
 const apply = process.argv.includes("--apply");
 const allowPartial = process.argv.includes("--allow-partial");
 const includeAll = process.argv.includes("--all");
+const aggressive = process.argv.includes("--aggressive") || process.env.CLEANUP_AGGRESSIVE === "true";
+const targetCount = readArgNumber("--target-count", Number(process.env.CLEANUP_TARGET_COUNT || 500));
 const applyPlanPath = readArgValue("--apply-plan");
 const retryErrorsPath = readArgValue("--retry-errors");
 const allowIdentityDelete = process.env.CLEANUP_ALLOW_IDENTITY_DELETE === "true";
@@ -177,6 +180,7 @@ function isPriorityCandidate(memory) {
   const content = String(memory.content || "");
   const tags = Array.isArray(memory.tags) ? memory.tags : [];
   if (!isScannableMemory(memory)) return false;
+  if (aggressive) return true;
   if (includeAll) return true;
   if (content.length >= 360) return true;
   if (memory.type === "excerpt" || memory.type === "diary") return true;
@@ -205,6 +209,41 @@ function buildBatches(memories) {
     _theme: themeOf(memory),
     _shingles: textShingles(memory.content)
   }));
+
+  if (aggressive) {
+    const groups = new Map();
+    for (const record of records) {
+      const kind = record.type === "excerpt" ? "excerpt" : "fact";
+      const key = `${record._theme}::${kind}`;
+      const group = groups.get(key) || [];
+      group.push(record);
+      groups.set(key, group);
+    }
+
+    const batches = [];
+    for (const [key, group] of [...groups.entries()].sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]))) {
+      const [theme, kind] = key.split("::");
+      const sortedGroup = group.sort((a, b) => {
+        const importanceDiff = (a.importance || 0) - (b.importance || 0);
+        if (importanceDiff !== 0) return importanceDiff;
+        return String(a.updated_at || "").localeCompare(String(b.updated_at || ""));
+      });
+      for (let index = 0; index < sortedGroup.length; index += batchSize) {
+        const batchRecords = sortedGroup
+          .slice(index, index + batchSize)
+          .map(({ _theme, _shingles, ...memory }) => memory);
+        batches.push({
+          theme,
+          kind,
+          target_keep_count: Math.max(2, Math.ceil(batchRecords.length * targetCount / Math.max(memories.length, 1))),
+          records: batchRecords
+        });
+      }
+    }
+
+    return batches.slice(0, maxBatches);
+  }
+
   const used = new Set();
   const batches = [];
   const sorted = [...records].sort((a, b) => {
@@ -277,6 +316,18 @@ function taxonomyText() {
 
 function buildPlannerPrompt(batch) {
   const records = batch.records.map(compactRecord);
+  const targetKeep = batch.target_keep_count || Math.max(2, Math.ceil(records.length * 0.55));
+  const aggressiveRules = aggressive
+    ? [
+        "激进预算模式：",
+        `- 全库目标数量约 ${targetCount} 条；本批 ${records.length} 条建议压到约 ${targetKeep} 条以内。`,
+        "- 默认不要逐条 keep。除非是身份/persona/pinned、明确边界、高价值原文摘录、稳定强偏好，否则优先合并或删除。",
+        "- 对 note/diary/project/preference/relationship：相近主题应尽量进入 replacement_groups，通常 4-12 条合并成 1-3 条。",
+        "- 对 excerpt：只保留少数最有代表性的原文；其他原文要么压缩成事实/偏好/边界，要么删除无长期价值片段。",
+        "- 临时调试、一次性工具点评、已完成待办、重复情绪流水、旧模型测评、过期项目状态，要更果断 discard。",
+        "- updates 只用于确实值得保留且不需要压缩的记录；不要把 updates 当成默认去向。"
+      ].join("\n")
+    : "";
   return [
     "你是长期记忆库的分类和去重审计员。你的任务是判断哪些旧记忆应保留、改标签、合并压缩、或删除。",
     "只输出完整 JSON，不要 markdown，不要解释。",
@@ -288,6 +339,8 @@ function buildPlannerPrompt(batch) {
     "- 这类内容如果是稳定事实、偏好、边界、关系状态，要保留或压缩；不要因为色情/亲密而安全审查式删除。",
     "- 不要续写、不生成新色情内容；这里只做事实记忆整理。",
     "",
+    aggressiveRules,
+    aggressiveRules ? "" : "",
     "审计规则：",
     "- 明显重复、同义重复、旧版被新版覆盖：放入 replacement_groups 让压缩模型合并。",
     "- 临时性、过期流水账、debug/test、无未来价值的系统噪音：放入 discard_ids，并写短 reason。",
@@ -320,7 +373,7 @@ function buildPlannerPrompt(batch) {
       notes: "极短说明"
     }),
     "",
-    `本批主题：${batch.theme}`,
+    `本批主题：${batch.theme}${batch.kind ? ` / ${batch.kind}` : ""}`,
     "待审计记忆：",
     JSON.stringify(records)
   ].join("\n");
@@ -347,6 +400,7 @@ function buildCompressorPrompt(batch, groups) {
     "- 普通记忆用第二人称：关于用户写“你……”，关于旦九承诺写“我……”。",
     "- 助手角色统一写“旦九”，不要写“助手”“AI”“小克”。",
     "- 每组通常输出 1 条 replacement；多主题才输出 2 条。",
+    aggressive ? "- 激进预算模式下，每条 replacement 应覆盖更多源记录，优先输出高度概括的事实/偏好/边界，而不是保留细碎流水。" : "",
     "- note/preference/boundary/relationship/project 必须压到 60-220 个汉字，超过说明你没有完成压缩。",
     "- 原文摘录只有非常值得保留时才输出 excerpt；excerpt 不改写原文，通常不超过 700 个汉字。",
     "",
@@ -661,8 +715,24 @@ async function applyPlan(plans) {
   const updated = [];
   const deleted = [];
 
-  for (const plan of plans) {
-    for (const replacement of plan.replacements) {
+  async function runLimited(items, limit, fn) {
+    const results = new Array(items.length);
+    let nextIndex = 0;
+    const workers = Array.from({ length: Math.min(limit, Math.max(items.length, 1)) }, async () => {
+      for (;;) {
+        const index = nextIndex;
+        nextIndex += 1;
+        if (index >= items.length) return;
+        results[index] = await fn(items[index], index);
+      }
+    });
+    await Promise.all(workers);
+    return results.filter(Boolean);
+  }
+
+  const createJobs = plans.flatMap((plan) => plan.replacements.map((replacement) => ({ plan, replacement })));
+  created.push(
+    ...(await runLimited(createJobs, applyConcurrency, async ({ plan, replacement }) => {
       const response = await aelios("/v1/memory", {
         method: "POST",
         body: JSON.stringify({
@@ -675,35 +745,35 @@ async function applyPlan(plans) {
           source_message_ids: replacement.source_ids
         })
       });
-      created.push(response.data);
-      await sleep(350);
-    }
-  }
+      return response.data;
+    }))
+  );
 
-  for (const plan of plans) {
-    for (const item of plan.updates) {
+  const updateJobs = plans.flatMap((plan) => plan.updates.map((item) => ({ plan, item })));
+  updated.push(
+    ...(await runLimited(updateJobs, applyConcurrency, async ({ plan, item }) => {
       const body = {
         ...(item.type ? { type: item.type } : {}),
         ...(item.tags?.length ? { tags: [...new Set(["deep-clean", plan.theme, ...item.tags])] } : {}),
         ...(typeof item.importance === "number" ? { importance: item.importance } : {}),
         ...(typeof item.confidence === "number" ? { confidence: item.confidence } : {})
       };
-      if (Object.keys(body).length === 0) continue;
+      if (Object.keys(body).length === 0) return null;
       const response = await aelios(`/v1/memory/${encodeURIComponent(item.id)}`, {
         method: "PATCH",
         body: JSON.stringify(body)
       });
-      updated.push(response.data);
-      await sleep(250);
-    }
-  }
+      return response.data;
+    }))
+  );
 
   const deleteIds = [...new Set(plans.flatMap((plan) => plan.delete_ids))];
-  for (const id of deleteIds) {
+  deleted.push(
+    ...(await runLimited(deleteIds, applyConcurrency, async (id) => {
     await aelios(`/v1/memory/${encodeURIComponent(id)}`, { method: "DELETE" });
-    deleted.push(id);
-    await sleep(300);
-  }
+      return id;
+    }))
+  );
 
   return { created_count: created.length, updated_count: updated.length, deleted_count: deleted.length, created, updated, deleted };
 }
@@ -758,7 +828,10 @@ const report = {
   planner_model: plannerModel,
   compressor_model: compressorModel,
   batch_size: batchSize,
+  aggressive,
+  target_count: targetCount,
   cleanup_concurrency: cleanupConcurrency,
+  apply_concurrency: applyConcurrency,
   total_memories: memories.length,
   candidate_count: memories.filter(isPriorityCandidate).length,
   batch_count: batches.length,
