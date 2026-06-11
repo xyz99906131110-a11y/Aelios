@@ -509,10 +509,14 @@ function formatDailySummary(result: DailyDigestResult, dateLabel: string, messag
 
 async function callDigestModel(
   env: Env,
-  prompt: string
+  prompt: string,
+  meta: { dateLabel: string; messageCount: number; memoryCount: number; hasMore: boolean }
 ): Promise<DigestModelCallResult> {
   const model = readDreamModel(env);
-  if (!model) return { digest: null, reason: "missing_model" };
+  if (!model) {
+    console.error("dream: missing model");
+    return { digest: null, reason: "missing_model" };
+  }
 
   const request: OpenAIChatRequest = {
     model,
@@ -528,19 +532,63 @@ async function callDigestModel(
     stream: false
   };
 
+  const startedAt = Date.now();
+  console.log("dream: calling model", {
+    date: meta.dateLabel,
+    model,
+    messageCount: meta.messageCount,
+    memoryCount: meta.memoryCount,
+    hasMore: meta.hasMore,
+    promptChars: prompt.length,
+    maxTokens: request.max_tokens
+  });
+
   try {
     const response = await callOpenAICompat(env, request);
-    if (!response.ok) return { digest: null, reason: "model_error", model, status: response.status };
+    const elapsedMs = Date.now() - startedAt;
+    if (!response.ok) {
+      console.error("dream: model returned non-ok", {
+        date: meta.dateLabel,
+        model,
+        status: response.status,
+        statusText: response.statusText,
+        elapsedMs
+      });
+      return { digest: null, reason: "model_error", model, status: response.status };
+    }
     const parsed = (await response.json()) as OpenAIChatResponse;
     const choice = parsed.choices?.[0];
     const message = choice?.message as ({ content?: unknown; reasoning_content?: unknown }) | undefined;
     const content = typeof message?.content === "string" ? message.content.trim() : "";
     const reasoning = typeof message?.reasoning_content === "string" ? message.reasoning_content.trim() : "";
     const json = extractJsonObject(content || reasoning);
-    if (!json) return { digest: null, reason: "model_invalid_json", model, finishReason: choice?.finish_reason };
+    if (!json) {
+      console.error("dream: model returned invalid JSON", {
+        date: meta.dateLabel,
+        model,
+        elapsedMs,
+        finishReason: choice?.finish_reason ?? null,
+        contentChars: content.length,
+        reasoningChars: reasoning.length
+      });
+      return { digest: null, reason: "model_invalid_json", model, finishReason: choice?.finish_reason };
+    }
+    console.log("dream: model returned valid JSON", {
+      date: meta.dateLabel,
+      model,
+      elapsedMs,
+      finishReason: choice?.finish_reason ?? null,
+      contentChars: content.length,
+      reasoningChars: reasoning.length
+    });
     return { digest: normalizeDigestResult(json), model };
   } catch (error) {
-    console.error("dream model failed", error);
+    console.error("dream model failed", {
+      date: meta.dateLabel,
+      model,
+      elapsedMs: Date.now() - startedAt,
+      error: error instanceof Error && error.message ? error.message : String(error)
+    });
     return { digest: null, reason: "model_error", model };
   }
 }
@@ -703,7 +751,12 @@ export async function runDailyMemoryDigest(
     excerptLimit: readDreamExcerptLimit(env),
     hasMore
   });
-  const modelResult = await callDigestModel(env, prompt);
+  const modelResult = await callDigestModel(env, prompt, {
+    dateLabel,
+    messageCount: messages.length,
+    memoryCount: existingMemories.length,
+    hasMore
+  });
   const digest = modelResult.digest;
   if (!digest) {
     console.error("dream: model did not return valid JSON; cursor not advanced", {

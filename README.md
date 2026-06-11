@@ -366,10 +366,10 @@ Model:      companion
 | `ENABLE_INCREMENTAL_MEMORY` | `false` | 设 `true` 才恢复每轮聊天后即时抽取 |
 | `ENABLE_DREAM` | `true` | 夜间 dream 开关 |
 | `DREAM_TIME_ZONE` | `Asia/Singapore` | dream 按这个时区切自然日；默认每天凌晨处理昨天 |
-| `DREAM_MAX_MESSAGES` | `320` | 每次 dream 最多处理的原始消息数；当天太长会分批继续 |
-| `DREAM_MAX_RUNS` | `3` | 每次定时任务最多连续 dream 几批，防止单次模型输入太大 |
-| `DREAM_MAX_TOKENS` | `5000` | dream 模型最多输出 token |
-| `DREAM_MEMORY_CONTEXT_LIMIT` | `250` | dream 时提供给模型参考的旧记忆数量 |
+| `DREAM_MAX_MESSAGES` | `40` | 每次 dream 最多处理的原始消息数；当天太长会分批继续 |
+| `DREAM_MAX_RUNS` | `10` | 每次定时任务最多连续 dream 几批，防止单次模型输入太大 |
+| `DREAM_MAX_TOKENS` | `8000` | dream 模型最多输出 token |
+| `DREAM_MEMORY_CONTEXT_LIMIT` | `40` | dream 时提供给模型参考的旧记忆数量 |
 | `DREAM_EXCERPT_LIMIT` | `8` | dream 每天最多保存的重要原文段落 |
 | `ENABLE_DAILY_SUMMARY_MEMORY` | `false` | 设 `true` 才把每日摘要也写入 Vectorize；默认只留在 D1 |
 | `EMPTY_MEMORY_MIN_CHARS` | `4` | 每日整理时清理短空记忆的阈值 |
