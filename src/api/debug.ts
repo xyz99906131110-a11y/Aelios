@@ -1,9 +1,9 @@
 import { authenticate } from "../auth/apiKey";
 import { requireScope } from "../auth/scopes";
-import { createMemory, getMemoryById, listMemoriesPage, updateMemory } from "../db/memories";
-import { createEmbedding, upsertMemoryEmbedding } from "../memory/embedding";
+import { getMemoryById, updateMemory } from "../db/memories";
+import { createEmbedding } from "../memory/embedding";
 import { searchMemories, toMemoryApiRecord } from "../memory/search";
-import { deleteSyncedMemory, syncMemoryVector } from "../memory/state";
+import { createSyncedMemory, deleteSyncedMemory, syncMemoryVector } from "../memory/state";
 import {
   extractRefIdFromVector,
   extractStatusFromVector
@@ -137,7 +137,6 @@ async function waitForVectorMemory(
     });
 
     const visible =
-      Boolean(getByPublicId || getByVectorId) ||
       directQuery.namespaced.some((match) => match.id === memory.vector_id || match.ref_id === memory.id) ||
       directQuery.legacy.some((match) => match.id === memory.vector_id || match.ref_id === memory.id) ||
       apiSearch.some((item) => item.id === memory.id || item.vector_id === memory.vector_id);
@@ -205,7 +204,7 @@ export async function handleVectorHealth(request: Request, env: Env): Promise<Re
     const beforeQuery = await queryVectorize(env, vector, namespace);
     checks.before_query = beforeQuery;
 
-    const createdRecord = await createMemory(env.DB, {
+    const createdRecord = await createSyncedMemory(env, {
       namespace,
       type: "debug",
       content: phrase,
@@ -214,7 +213,6 @@ export async function handleVectorHealth(request: Request, env: Env): Promise<Re
       tags: ["vector-health"],
       source: "debug"
     });
-    await upsertMemoryEmbedding(env, createdRecord);
     created = toMemoryApiRecord(createdRecord);
     checks.create = {
       ok: true,

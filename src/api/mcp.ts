@@ -139,7 +139,7 @@ function getTools(): Array<Record<string, unknown>> {
     },
     {
       name: "memory_get",
-      description: "Get one memory from the Vectorize memory library by id.",
+      description: "Get one memory from the long-term memory library by id.",
       inputSchema: {
         type: "object",
         properties: {
@@ -150,7 +150,7 @@ function getTools(): Array<Record<string, unknown>> {
     },
     {
       name: "memory_delete",
-      description: "Delete one memory from the Vectorize memory library by id.",
+      description: "Delete one memory from the long-term memory library by id.",
       inputSchema: {
         type: "object",
         properties: {

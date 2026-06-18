@@ -423,13 +423,19 @@ export async function markMemoriesRecalled(
 ): Promise<void> {
   if (input.ids.length === 0) return;
 
-  const placeholders = input.ids.map(() => "?").join(", ");
-  await db
-    .prepare(
-      `UPDATE memories
-       SET last_recalled_at = ?, recall_count = recall_count + 1
-       WHERE namespace = ? AND id IN (${placeholders})`
-    )
-    .bind(nowIso(), input.namespace, ...input.ids)
-    .run();
+  const D1_IN_BATCH_SIZE = 90;
+  const now = nowIso();
+
+  for (let i = 0; i < input.ids.length; i += D1_IN_BATCH_SIZE) {
+    const batch = input.ids.slice(i, i + D1_IN_BATCH_SIZE);
+    const placeholders = batch.map(() => "?").join(", ");
+    await db
+      .prepare(
+        `UPDATE memories
+         SET last_recalled_at = ?, recall_count = recall_count + 1
+         WHERE namespace = ? AND id IN (${placeholders})`
+      )
+      .bind(now, input.namespace, ...batch)
+      .run();
+  }
 }

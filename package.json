@@ -24,8 +24,5 @@
     "@cloudflare/workers-types": "^4.20250927.0",
     "typescript": "^5.9.3",
     "wrangler": "^4.40.2"
-  },
-  "dependencies": {
-    "2": "^0.0.1-security"
   }
 }

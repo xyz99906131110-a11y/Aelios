@@ -92,6 +92,7 @@ export async function deleteSyncedMemory(
 ): Promise<MemoryRecord | null> {
   const existing = await getMemoryById(env.DB, { namespace, id });
   if (!existing) return null;
+  if (existing.pinned) return existing;
 
   const deleted = await softDeleteMemory(env.DB, { namespace, id });
   if (!deleted) return null;
@@ -108,6 +109,10 @@ export async function markMemoryReviewSynced(
   id: string,
   auditState?: string
 ): Promise<MemoryRecord | null> {
+  const existing = await getMemoryById(env.DB, { namespace, id });
+  if (!existing) return null;
+  if (existing.pinned) return existing;
+
   const patch: UpdateMemoryInput = { status: "review" };
   if (auditState) patch.auditState = auditState;
 
@@ -129,33 +134,40 @@ export async function supersedeSyncedMemory(
 ): Promise<{ old: MemoryRecord | null; created: MemoryRecord }> {
   const oldExisting = await getMemoryById(env.DB, { namespace, id: oldId });
 
-  const superseded = await updateMemory(env.DB, {
-    namespace,
-    id: oldId,
-    patch: { status: "superseded" },
-  });
-  if (superseded) {
-    const syncStatus = await removeVector(env, superseded);
-    await updateSyncStatus(env, namespace, oldId, syncStatus);
-  }
-
-  if (eventPayload && oldExisting) {
-    await createMemoryEvent(env.DB, {
+  if (oldExisting && !oldExisting.pinned) {
+    const superseded = await updateMemory(env.DB, {
       namespace,
-      eventType: "z_conflict",
-      memoryId: oldId,
-      payload: eventPayload,
+      id: oldId,
+      patch: { status: "superseded" },
     });
+    if (superseded) {
+      const syncStatus = await removeVector(env, superseded);
+      await updateSyncStatus(env, namespace, oldId, syncStatus);
+    }
+
+    if (eventPayload) {
+      await createMemoryEvent(env.DB, {
+        namespace,
+        eventType: "z_conflict",
+        memoryId: oldId,
+        payload: eventPayload,
+      });
+    }
   }
 
   const created = await createSyncedMemory(env, newMemoryInput);
-  return { old: superseded, created };
+  return { old: oldExisting?.pinned ? oldExisting : (await getMemoryById(env.DB, { namespace, id: oldId })), created };
 }
 
 export async function syncMemoryVector(
   env: Env,
   memory: MemoryRecord
 ): Promise<VectorSyncStatus> {
+  if (memory.status !== "active") {
+    const status = await removeVector(env, memory);
+    await updateSyncStatus(env, memory.namespace, memory.id, status);
+    return status;
+  }
   const status = await syncVector(env, memory);
   await updateSyncStatus(env, memory.namespace, memory.id, status);
   return status;
