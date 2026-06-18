@@ -21,6 +21,8 @@ export interface CreateMemoryInput {
   urgencyLevel?: string | null;
   tensionScore?: number | null;
   responsePosture?: string | null;
+  auditState?: string | null;
+  vectorSyncStatus?: string | null;
 }
 
 export interface ListMemoryFilters {
@@ -54,6 +56,8 @@ export interface UpdateMemoryInput {
   urgencyLevel?: string | null;
   tensionScore?: number | null;
   responsePosture?: string | null;
+  auditState?: string | null;
+  vectorSyncStatus?: string | null;
 }
 
 export async function createMemory(db: D1Database, input: CreateMemoryInput): Promise<MemoryRecord> {
@@ -84,7 +88,9 @@ export async function createMemory(db: D1Database, input: CreateMemoryInput): Pr
     risk_level: input.riskLevel ?? null,
     urgency_level: input.urgencyLevel ?? null,
     tension_score: input.tensionScore ?? null,
-    response_posture: input.responsePosture ?? null
+    response_posture: input.responsePosture ?? null,
+    audit_state: input.auditState ?? null,
+    vector_sync_status: input.vectorSyncStatus ?? null
   };
 
   await db
@@ -92,8 +98,9 @@ export async function createMemory(db: D1Database, input: CreateMemoryInput): Pr
       `INSERT INTO memories (
         id, namespace, type, content, summary, importance, confidence, status,
         pinned, tags, source, source_message_ids, vector_id, created_at, updated_at, expires_at,
-        fact_key, thread, risk_level, urgency_level, tension_score, response_posture
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        fact_key, thread, risk_level, urgency_level, tension_score, response_posture,
+        audit_state, vector_sync_status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       record.id,
@@ -117,7 +124,9 @@ export async function createMemory(db: D1Database, input: CreateMemoryInput): Pr
       record.risk_level,
       record.urgency_level,
       record.tension_score,
-      record.response_posture
+      record.response_posture,
+      record.audit_state,
+      record.vector_sync_status
     )
     .run();
 
@@ -181,13 +190,20 @@ export async function fetchMemoriesByIds(
 ): Promise<MemoryRecord[]> {
   if (input.ids.length === 0) return [];
 
-  const placeholders = input.ids.map(() => "?").join(", ");
-  const result = await db
-    .prepare(`SELECT * FROM memories WHERE namespace = ? AND id IN (${placeholders})`)
-    .bind(input.namespace, ...input.ids)
-    .all<MemoryRecord>();
+  const D1_IN_BATCH_SIZE = 90;
+  const results: MemoryRecord[] = [];
 
-  return result.results ?? [];
+  for (let i = 0; i < input.ids.length; i += D1_IN_BATCH_SIZE) {
+    const batch = input.ids.slice(i, i + D1_IN_BATCH_SIZE);
+    const placeholders = batch.map(() => "?").join(", ");
+    const result = await db
+      .prepare(`SELECT * FROM memories WHERE namespace = ? AND id IN (${placeholders})`)
+      .bind(input.namespace, ...batch)
+      .all<MemoryRecord>();
+    results.push(...(result.results ?? []));
+  }
+
+  return results;
 }
 
 export async function updateMemory(
@@ -218,6 +234,8 @@ export async function updateMemory(
   if (input.patch.urgencyLevel !== undefined) set("urgency_level", input.patch.urgencyLevel);
   if (input.patch.tensionScore !== undefined) set("tension_score", input.patch.tensionScore);
   if (input.patch.responsePosture !== undefined) set("response_posture", input.patch.responsePosture);
+  if (input.patch.auditState !== undefined) set("audit_state", input.patch.auditState);
+  if (input.patch.vectorSyncStatus !== undefined) set("vector_sync_status", input.patch.vectorSyncStatus);
 
   if (assignments.length === 0) {
     return getMemoryById(db, input);

@@ -4,7 +4,7 @@ import { getOrCreateConversation } from "../db/conversations";
 import { createMemory, getMemoryById, listMemoriesPage, softDeleteMemory, updateMemory } from "../db/memories";
 import { saveIngestMessages } from "../db/messages";
 import { runDailyMemoryDigest } from "../memory/dailyDigest";
-import { upsertMemoryEmbedding } from "../memory/embedding";
+import { upsertMemoryEmbedding, deleteMemoryEmbedding } from "../memory/embedding";
 import { filterAndCompressMemoriesWithMeta } from "../memory/filter";
 import { formatMemoryPatch } from "../memory/inject";
 import {
@@ -284,7 +284,13 @@ async function handlePatchMemory(
   };
 
   const updated = await updateMemory(env.DB, { namespace, id, patch });
-  if (updated) await upsertMemoryEmbedding(env, updated);
+  if (updated) {
+    if (updated.status === "active") {
+      await upsertMemoryEmbedding(env, updated);
+    } else {
+      await deleteMemoryEmbedding(env, updated);
+    }
+  }
 
   if (!updated) return openAiError("Memory not found", 404);
   return json({ data: toMemoryApiRecord(updated) });
@@ -301,7 +307,8 @@ async function handleDeleteMemory(
   const existing = await getMemoryById(env.DB, { namespace: profile.namespace, id });
   if (!existing || existing.namespace !== profile.namespace) return openAiError("Memory not found", 404);
 
-  await softDeleteMemory(env.DB, { namespace: profile.namespace, id });
+  const deleted = await softDeleteMemory(env.DB, { namespace: profile.namespace, id });
+  if (deleted) await deleteMemoryEmbedding(env, deleted);
   return json({ data: { id: existing.id, vector_id: existing.vector_id, deleted: true } });
 }
 

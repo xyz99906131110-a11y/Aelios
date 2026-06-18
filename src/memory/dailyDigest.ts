@@ -12,7 +12,7 @@ import {
   normalizeThread,
   normalizeUrgencyLevel
 } from "./coordinates";
-import { upsertMemoryEmbedding } from "./embedding";
+import { upsertMemoryEmbedding, deleteMemoryEmbedding } from "./embedding";
 import type { ExtractedMemory } from "./extract";
 import { toMemoryApiRecord } from "./search";
 
@@ -742,7 +742,8 @@ async function applyMemoryUpdates(
   for (const item of input.deletes) {
     const existing = await getMemoryById(env.DB, { namespace: input.namespace, id: item.target_id });
     if (!existing || existing.status !== "active" || existing.pinned) continue;
-    await softDeleteMemory(env.DB, { namespace: input.namespace, id: item.target_id });
+    const result = await softDeleteMemory(env.DB, { namespace: input.namespace, id: item.target_id });
+    if (result) await deleteMemoryEmbedding(env, result);
     deleted += 1;
   }
 

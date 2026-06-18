@@ -42,6 +42,40 @@ export async function runZAudit(
 
   for (const conflict of conflicts) {
     const ids = conflict.ids.split(",").map((id) => id.trim()).filter(Boolean);
+    const memories: MemoryRecord[] = [];
+    for (const id of ids) {
+      const memory = await getMemoryById(env.DB, { namespace, id });
+      if (memory) memories.push(memory);
+    }
+
+    const activeNonPinned = memories.filter((m) => m.status === "active" && !m.pinned);
+    const activePinned = memories.filter((m) => m.status === "active" && m.pinned);
+
+    if (activePinned.length > 0 || activeNonPinned.length <= 1) {
+      await createMemoryEvent(env.DB, {
+        namespace,
+        eventType: "z_audit",
+        payload: {
+          fact_key: conflict.fact_key,
+          memory_ids: ids,
+          count: conflict.count,
+          action: "no_change",
+          reason: activePinned.length > 0 ? "pinned_memory_present" : "single_active"
+        }
+      });
+      events += 1;
+      continue;
+    }
+
+    const ranked = [...activeNonPinned].sort((a, b) => {
+      if (a.confidence !== b.confidence) return b.confidence - a.confidence;
+      if (a.importance !== b.importance) return b.importance - a.importance;
+      return b.updated_at.localeCompare(a.updated_at);
+    });
+
+    const best = ranked[0];
+    const weaker = ranked.slice(1);
+
     await createMemoryEvent(env.DB, {
       namespace,
       eventType: "z_audit",
@@ -49,18 +83,24 @@ export async function runZAudit(
         fact_key: conflict.fact_key,
         memory_ids: ids,
         count: conflict.count,
-        action: "mark_review_non_pinned"
+        action: "keep_best_mark_weaker",
+        best_id: best.id,
+        weaker_ids: weaker.map((m) => m.id)
       }
     });
     events += 1;
 
-    for (const id of ids) {
-      const memory = await getMemoryById(env.DB, { namespace, id });
-      if (!memory || memory.status !== "active" || memory.pinned) continue;
+    await updateMemory(env.DB, {
+      namespace,
+      id: best.id,
+      patch: { auditState: "best_candidate" }
+    });
+
+    for (const memory of weaker) {
       await updateMemory(env.DB, {
         namespace,
-        id,
-        patch: { status: "review" }
+        id: memory.id,
+        patch: { status: "review", auditState: "weaker_conflict" }
       });
       reviewed += 1;
     }

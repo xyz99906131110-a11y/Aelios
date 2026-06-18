@@ -4,7 +4,8 @@ import { createMemory, getMemoryById, listMemoriesPage, softDeleteMemory } from 
 import { createEmbedding, deleteMemoryEmbedding, upsertMemoryEmbedding } from "../memory/embedding";
 import { searchMemories, toMemoryApiRecord } from "../memory/search";
 import {
-  vectorMetadataToMemoryRecord
+  extractRefIdFromVector,
+  extractStatusFromVector
 } from "../memory/vectorStore";
 import { json, openAiError } from "../utils/json";
 import type { Env, KeyProfile, MemoryApiRecord } from "../types";
@@ -66,15 +67,12 @@ function readEmbeddingProvider(model: string): string {
 }
 
 function compactMatch(match: VectorizeMatch): Record<string, unknown> {
-  const record = vectorMetadataToMemoryRecord(match, match.score);
   return {
     id: match.id,
     vector_namespace: match.namespace,
     score: match.score,
-    namespace: record?.namespace,
-    ref_id: record?.id,
-    type: record?.type,
-    content_preview: record?.content.slice(0, 120)
+    ref_id: extractRefIdFromVector(match),
+    status: extractStatusFromVector(match),
   };
 }
 

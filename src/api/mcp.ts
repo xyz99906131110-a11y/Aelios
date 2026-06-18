@@ -10,7 +10,7 @@ import {
   normalizeThread,
   normalizeUrgencyLevel
 } from "../memory/coordinates";
-import { upsertMemoryEmbedding } from "../memory/embedding";
+import { upsertMemoryEmbedding, deleteMemoryEmbedding } from "../memory/embedding";
 import { filterAndCompressMemories } from "../memory/filter";
 import { searchMemories, toMemoryApiRecord } from "../memory/search";
 import { enqueueMemoryMaintenanceIfNeeded } from "../queue/producer";
@@ -283,7 +283,8 @@ async function callTool(
     const existing = await getMemoryById(env.DB, { namespace, id });
     if (!existing) return toolError("Memory not found");
     if (existing.pinned) return toolError("Pinned memory cannot be deleted");
-    await softDeleteMemory(env.DB, { namespace, id });
+    const deleted = await softDeleteMemory(env.DB, { namespace, id });
+    if (deleted) await deleteMemoryEmbedding(env, deleted);
     return textToolResult({
       data: {
         id,

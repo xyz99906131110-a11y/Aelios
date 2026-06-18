@@ -207,6 +207,8 @@ export interface MemoryRecord {
   urgency_level: string | null;
   tension_score: number | null;
   response_posture: string | null;
+  audit_state: string | null;
+  vector_sync_status: string | null;
 }
 
 export interface MemoryApiRecord {
@@ -234,6 +236,8 @@ export interface MemoryApiRecord {
   urgency_level: string | null;
   tension_score: number | null;
   response_posture: string | null;
+  audit_state: string | null;
+  vector_sync_status: string | null;
   score?: number;
 }
 
