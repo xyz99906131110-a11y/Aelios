@@ -41,6 +41,15 @@ export function hasToolContent(body: OpenAIChatRequest): boolean {
   );
 }
 
+export function hasTools(body: OpenAIChatRequest): boolean {
+  return Array.isArray(body.tools) && body.tools.length > 0;
+}
+
+/** Determine whether this request needs the tool-call passthrough path. */
+export function hasToolRound(body: OpenAIChatRequest): boolean {
+  return hasTools(body) || hasToolContent(body);
+}
+
 // Tool-path fallback (assembler not used here yet): inject pinned persona as a
 // leading system message, then the RAG memory patch after the existing system
 // messages. If persona is empty this degrades to injectMemoryPatchAsSystemMessage.
@@ -145,8 +154,9 @@ export async function handleChatCompletions(
   let cacheAnchorBlock: string | null = null;
   try {
     if (provider === "anthropic") {
-      if (hasToolContent(body)) {
-        // Tool path uses legacy adapter (buildAnthropicNativeRequest) which includes stable memory pack; assembler integration is tracked separately.
+      if (hasToolRound(body)) {
+        // Tool call passthrough: send tools/tool_choice to the model directly.
+        // Native request keeps the stable memory pack; assembler integration is tracked separately.
         const anthropicRequest = await buildAnthropicNativeRequest(body, {
           env,
           targetModel,
@@ -169,7 +179,7 @@ export async function handleChatCompletions(
         upstream = await callAnthropicNative(env, buildAnthropicRequestFromAssembled(body, targetModel, assembled, env), targetModel);
       }
     } else {
-      if (hasToolContent(body)) {
+      if (hasToolRound(body)) {
         // Tool path: assembler not wired here yet; inject persona + RAG patches
         // directly so pinned persona is not lost on the OpenAI tool fallback.
         const patchedBody = injectPersonaAndMemoryPatches(body, pinnedPersonaMemories, memories);
