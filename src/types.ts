@@ -216,15 +216,22 @@ export interface MemoryRecord {
   created_at: string;
   updated_at: string;
   expires_at: string | null;
-  // --- v2 字段 (母帖 #11 第 1 步，可选，老代码读不到就忽略) ---
-  fact_key?: string | null;
-  supersedes_id?: string | null;
-  superseded_by_id?: string | null;
-  review_reason?: string | null;
-  valid_as_of?: string | null;
-  last_seen_at?: string | null;
-  seen_count?: number;
-  last_injected_at?: string | null;
+}
+
+// v2 字段侧车表 (母帖 #11 第 1 步，sidecar 版)。
+// 不放 memories 本体——ALTER ADD COLUMN 不幂等，会让 fork 部署炸。
+// memory_id 关联 memories.id，PRIMARY KEY(memory_id) 一对一。
+export interface MemoryLifecycleRow {
+  memory_id: string;
+  namespace: string;
+  fact_key: string | null;
+  supersedes_id: string | null;
+  superseded_by_id: string | null;
+  review_reason: string | null;
+  valid_as_of: string | null;
+  last_seen_at: string | null;
+  seen_count: number;
+  last_injected_at: string | null;
 }
 
 export interface MemoryApiRecord {
@@ -247,7 +254,7 @@ export interface MemoryApiRecord {
   updated_at: string;
   expires_at: string | null;
   score?: number;
-  // --- v2 字段 (母帖 #11 第 1 步) ---
+  // --- v2 字段 (从 memory_lifecycle 侧车表合并来，可选) ---
   fact_key?: string | null;
   supersedes_id?: string | null;
   superseded_by_id?: string | null;

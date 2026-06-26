@@ -1,47 +1,48 @@
 -- Aelios 记忆库 v2 (母帖 #11 第 1 步)
--- 给现有 memories 表加 v2 列 + 新建四张表 (digest / precious / glossary / longtail)。
--- 只建表/加列，不动 v1 行为：新列默认 NULL/0，新表空着。
+-- 全部用 CREATE TABLE IF NOT EXISTS，天生幂等。
+-- 不动现有 memories 表 (不加列)——v2 字段进 memory_lifecycle 侧车表，
+-- 靠 memory_id 关联。这样所有 fork 部署都不会因 ALTER ADD COLUMN 重复列炸。
 -- 代码层只有 MEMORY_LIFECYCLE_ENABLED=true 才读写这些 (见第 0 步开关)。
 --
--- L2 raw_messages 的口径：复用现有 messages 表 (0001 已建)。它是 raw 对话本体，
--- chatCompletions 已在写、dream 已在读。母帖第六节写的 ts 字段即 messages.created_at。
--- 不新建 raw_messages，避免双写 900+ 条历史 + 改所有读写调用方。
---
--- Vectorize 复用现有 memo-kb 索引，用 metadata.kind 区分: memory | precious | longtail。
--- 配套在 scripts/setup-cloudflare.mjs 给 kind 建 metadata index，否则 kind 过滤走不上索引。
+-- L2 raw_messages 的口径：复用现有 messages 表 (0001 已建)，ts = created_at。
+-- Vectorize 复用 memo-kb，用 metadata.kind 区分: memory | precious | longtail。
 
 -- =====================================================================
--- L4 + L6 大库本体: 给现有 memories 加 v2 列
+-- L4 + L6 v2 字段侧车表 (不改 memories 本体)
 -- =====================================================================
+-- 一行对应一条 memories 记录的 v2 元数据。memory_id 关联 memories.id。
 -- fact_key: 同一件事按 key upsert，从源头止增 (L4)
 -- supersedes_id / superseded_by_id: world_fact 推翻链 (L6)
 -- review_reason: doctor/patrol 提案理由
 -- valid_as_of: world_fact 有效时点
--- last_seen_at / seen_count: 命中计数 (闸三降权用)
+-- last_seen_at / seen_count: 命中计数
 -- last_injected_at: 闸三节奏，近期注入过的降权 (不动 importance)
+--
+-- fact_key 语义：status 在 memories 表，跨表 partial unique SQLite 做不到，
+-- 因此侧车表只建普通索引，靠应用层 (upsertMemoryByFactKey 先查 active
+-- 对应的侧车行再写) 保证同一 namespace + fact_key 的 active 语义。
+-- 这是为了 fork 安全 (ALTER ADD COLUMN 不幂等) 主动让出的 DB 层硬约束。
+CREATE TABLE IF NOT EXISTS memory_lifecycle (
+  memory_id TEXT NOT NULL,
+  namespace TEXT NOT NULL DEFAULT 'default',
+  fact_key TEXT,
+  supersedes_id TEXT,
+  superseded_by_id TEXT,
+  review_reason TEXT,
+  valid_as_of TEXT,
+  last_seen_at TEXT,
+  seen_count INTEGER NOT NULL DEFAULT 0,
+  last_injected_at TEXT,
+  PRIMARY KEY (memory_id)
+);
 
-ALTER TABLE memories ADD COLUMN fact_key TEXT;
-ALTER TABLE memories ADD COLUMN supersedes_id TEXT;
-ALTER TABLE memories ADD COLUMN superseded_by_id TEXT;
-ALTER TABLE memories ADD COLUMN review_reason TEXT;
-ALTER TABLE memories ADD COLUMN valid_as_of TEXT;
-ALTER TABLE memories ADD COLUMN last_seen_at TEXT;
-ALTER TABLE memories ADD COLUMN seen_count INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE memories ADD COLUMN last_injected_at TEXT;
-
--- fact_key upsert 唯一性：同 namespace + fact_key 只能有一条 active。
--- partial unique index 真约束，并发/重试下也挡住重复 active 同 key。
--- (fact_key IS NULL 的 v1 老行不进索引，不影响。)
-CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_namespace_factkey
-ON memories(namespace, fact_key) WHERE fact_key IS NOT NULL AND status = 'active';
+-- fact_key upsert 查询用 (应用层先查再写，这个索引加速查 active 同 key)
+CREATE INDEX IF NOT EXISTS idx_lifecycle_namespace_factkey
+ON memory_lifecycle(namespace, fact_key) WHERE fact_key IS NOT NULL;
 
 -- supersede 链查询用
-CREATE INDEX IF NOT EXISTS idx_memories_supersedes
-ON memories(supersedes_id) WHERE supersedes_id IS NOT NULL;
-
--- world_fact 每日 supersede 检查用
-CREATE INDEX IF NOT EXISTS idx_memories_namespace_type_status
-ON memories(namespace, type, status);
+CREATE INDEX IF NOT EXISTS idx_lifecycle_supersedes
+ON memory_lifecycle(supersedes_id) WHERE supersedes_id IS NOT NULL;
 
 -- =====================================================================
 -- L1 摘要 (单行覆盖，每 namespace 一行)
@@ -74,8 +75,7 @@ ON precious(pinned);
 
 -- =====================================================================
 -- L5 黑话 glossary (词面召回，不进向量库)
--- 第 1 步先做精确词面匹配 (term 精确 + 应用层遍历 aliases JSON)。
--- BM25/FTS5 留到第 3 步召回管线时再升级，那时才需要分词和 rank。
+-- 第 1 步精确/子串匹配；BM25/FTS5 留到后续召回管线升级。
 -- =====================================================================
 CREATE TABLE IF NOT EXISTS glossary (
   id TEXT PRIMARY KEY,
@@ -90,8 +90,6 @@ CREATE TABLE IF NOT EXISTS glossary (
   seen_count INTEGER NOT NULL DEFAULT 0
 );
 
--- 词面命中查 term 用 (精确匹配，第 1 步)；aliases 是 JSON 数组，
--- 第 3 步如上 FTS5 时再拍平进 FTS，现阶段应用层遍历 JSON 匹配。
 CREATE INDEX IF NOT EXISTS idx_glossary_namespace_status
 ON glossary(namespace, status);
 

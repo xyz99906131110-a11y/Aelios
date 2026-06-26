@@ -1,5 +1,6 @@
 import { fetchMemoriesByIds, markMemoriesRecalled, searchMemoriesByText } from "../db/memories";
-import type { Env, MemoryApiRecord, MemoryRecord } from "../types";
+import { fetchMemoryLifecycleRows } from "../db/v2";
+import type { Env, MemoryApiRecord, MemoryLifecycleRow, MemoryRecord } from "../types";
 import { createEmbedding } from "./embedding";
 
 type MetadataMap = Record<string, unknown>;
@@ -14,7 +15,12 @@ function parseJsonArray(value: string | null): string[] {
   }
 }
 
-export function toMemoryApiRecord(record: MemoryRecord, score?: number): MemoryApiRecord {
+// v2 字段从 memory_lifecycle 侧车表合并 (可选)。lc 传 undefined 时 v2 字段全 null。
+export function toMemoryApiRecord(
+  record: MemoryRecord,
+  score?: number,
+  lc?: MemoryLifecycleRow | null
+): MemoryApiRecord {
   return {
     id: record.id,
     namespace: record.namespace,
@@ -34,15 +40,15 @@ export function toMemoryApiRecord(record: MemoryRecord, score?: number): MemoryA
     created_at: record.created_at,
     updated_at: record.updated_at,
     expires_at: record.expires_at,
-    // v2 字段 (母帖 #11)：闸三降权靠 last_injected_at，supersede 链靠 supersedes_*。
-    fact_key: record.fact_key ?? null,
-    supersedes_id: record.supersedes_id ?? null,
-    superseded_by_id: record.superseded_by_id ?? null,
-    review_reason: record.review_reason ?? null,
-    valid_as_of: record.valid_as_of ?? null,
-    last_seen_at: record.last_seen_at ?? null,
-    seen_count: record.seen_count ?? 0,
-    last_injected_at: record.last_injected_at ?? null,
+    // v2 字段 (侧车表)，闸三降权靠 last_injected_at，supersede 链靠 supersedes_*。
+    fact_key: lc?.fact_key ?? null,
+    supersedes_id: lc?.supersedes_id ?? null,
+    superseded_by_id: lc?.superseded_by_id ?? null,
+    review_reason: lc?.review_reason ?? null,
+    valid_as_of: lc?.valid_as_of ?? null,
+    last_seen_at: lc?.last_seen_at ?? null,
+    seen_count: lc?.seen_count ?? 0,
+    last_injected_at: lc?.last_injected_at ?? null,
     ...(score === undefined ? {} : { score })
   };
 }
@@ -270,5 +276,11 @@ export async function searchMemories(
     ids: records.map((record) => record.id)
   });
 
-  return records.map((record) => toMemoryApiRecord(record, record.score));
+  // v2: 批量查侧车行，合并 last_injected_at (闸三降权) 等 v2 字段。
+  const lifecycleRows = await fetchMemoryLifecycleRows(env.DB, records.map((r) => r.id));
+  const lifecycleByMemoryId = new Map(lifecycleRows.map((lc) => [lc.memory_id, lc]));
+
+  return records.map((record) =>
+    toMemoryApiRecord(record, record.score, lifecycleByMemoryId.get(record.id) ?? null)
+  );
 }

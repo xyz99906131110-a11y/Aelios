@@ -6,8 +6,8 @@
 // D1 是本体，Vectorize 是检索镜像 (母帖 L6)。只写 D1 不写向量 → recall 召不到。
 // 同步用 embedding.ts 的 upsertMemoryEmbedding / deleteMemoryEmbedding (已带 kind:"memory")。
 
-import { deleteMemoryEmbedding, upsertMemoryEmbedding } from "../memory/embedding";
-import type { Env, MemoryRecord } from "../types";
+import { upsertMemoryEmbedding } from "../memory/embedding";
+import type { Env, MemoryLifecycleRow, MemoryRecord } from "../types";
 import { newId } from "../utils/ids";
 import { nowIso } from "../utils/time";
 
@@ -322,7 +322,10 @@ export async function createLongtail(
 }
 
 // =====================================================================
-// memories v2: fact_key upsert + supersede
+// memories v2: fact_key upsert + supersede (侧车表版)
+// v2 字段 (fact_key/supersedes_*/last_injected_at 等) 进 memory_lifecycle 侧车表，
+// 不在 memories 本体加列 (ALTER ADD COLUMN 不幂等，会让 fork 部署炸)。
+// memories 表只写 v1 列 + status；侧车表靠 memory_id 关联，PRIMARY KEY 一对一。
 // =====================================================================
 
 export interface MemoryV2Patch {
@@ -341,8 +344,23 @@ export interface MemoryV2Patch {
   validAsOf?: string | null;
 }
 
+// 批量查侧车行 (search.ts 合并 v2 字段用)。不存在的 memory_id 不返回。
+export async function fetchMemoryLifecycleRows(
+  db: D1Database,
+  memoryIds: string[]
+): Promise<MemoryLifecycleRow[]> {
+  if (memoryIds.length === 0) return [];
+  const placeholders = memoryIds.map(() => "?").join(", ");
+  const result = await db
+    .prepare(`SELECT * FROM memory_lifecycle WHERE memory_id IN (${placeholders})`)
+    .bind(...memoryIds)
+    .all<MemoryLifecycleRow>();
+  return result.results ?? [];
+}
+
 // 按 fact_key upsert：同 namespace + fact_key 已有 active 就更新，否则新增。
-// 唯一性靠 0003 的 partial unique index 兜底；这里先查再写，减少冲突。
+// fact_key 语义：侧车表只有普通索引；应用层先查 active memories 对应的侧车行再写。
+// status 在 memories 表，跨表 partial unique SQLite 做不到，并发窗口靠 D1 单写缩小。
 // 同时写 D1 (本体) 和 Vectorize (检索镜像)，设 vector_id，否则 recall 召不到。
 export async function upsertMemoryByFactKey(
   env: Env,
@@ -350,19 +368,23 @@ export async function upsertMemoryByFactKey(
 ): Promise<{ id: string; created: boolean }> {
   const db = env.DB;
   const now = nowIso();
+
+  // 先查同 fact_key 的 active memory：memories join 侧车表。
   const existing = await db
     .prepare(
-      `SELECT id FROM memories WHERE namespace = ? AND fact_key = ? AND status = 'active'`
+      `SELECT m.id FROM memories m
+       JOIN memory_lifecycle lc ON lc.memory_id = m.id
+       WHERE m.namespace = ? AND m.status = 'active' AND lc.fact_key = ?`
     )
     .bind(input.namespace, input.factKey)
     .first<{ id: string }>();
 
   if (existing) {
+    // 更新 memories 本体 (v1 列)
     await db
       .prepare(
         `UPDATE memories SET content = ?, type = ?, importance = ?, confidence = ?,
-          tags = ?, source = ?, source_message_ids = ?, valid_as_of = ?,
-          last_seen_at = ?, seen_count = seen_count + 1, updated_at = ?
+          tags = ?, source = ?, source_message_ids = ?, updated_at = ?
          WHERE id = ?`
       )
       .bind(
@@ -373,26 +395,31 @@ export async function upsertMemoryByFactKey(
         JSON.stringify(input.tags ?? []),
         input.source ?? null,
         JSON.stringify(input.sourceMessageIds ?? []),
-        input.validAsOf ?? null,
-        now,
         now,
         existing.id
       )
       .run();
-    // 同步 Vectorize (镜像)。失败不阻断 D1 写入，只记日志。
+    // 更新侧车表 v2 字段
+    await db
+      .prepare(
+        `UPDATE memory_lifecycle SET valid_as_of = ?, last_seen_at = ?, seen_count = seen_count + 1
+         WHERE memory_id = ?`
+      )
+      .bind(input.validAsOf ?? null, now, existing.id)
+      .run();
     await syncMemoryVector(env, { namespace: input.namespace, id: existing.id });
     return { id: existing.id, created: false };
   }
 
+  // 新增：先插 memories 本体 (v1 列 + vector_id)，再插侧车行。
   const id = newId("mem");
   const vectorId = `mem_${id}`;
   await db
     .prepare(
       `INSERT INTO memories (
         id, namespace, type, content, importance, confidence, status, pinned,
-        tags, source, source_message_ids, fact_key, valid_as_of, vector_id,
-        last_seen_at, seen_count, created_at, updated_at, expires_at
-      ) VALUES (?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, null)`
+        tags, source, source_message_ids, vector_id, created_at, updated_at, expires_at
+      ) VALUES (?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, ?, ?, ?, ?, null)`
     )
     .bind(
       id,
@@ -404,14 +431,21 @@ export async function upsertMemoryByFactKey(
       JSON.stringify(input.tags ?? []),
       input.source ?? null,
       JSON.stringify(input.sourceMessageIds ?? []),
-      input.factKey,
-      input.validAsOf ?? null,
       vectorId,
-      now,
       now,
       now
     )
     .run();
+
+  await db
+    .prepare(
+      `INSERT INTO memory_lifecycle (
+        memory_id, namespace, fact_key, valid_as_of, last_seen_at, seen_count, last_injected_at
+      ) VALUES (?, ?, ?, ?, ?, 0, NULL)`
+    )
+    .bind(id, input.namespace, input.factKey, input.validAsOf ?? null, now)
+    .run();
+
   await syncMemoryVector(env, { namespace: input.namespace, id });
   return { id, created: true };
 }
@@ -430,8 +464,9 @@ async function syncMemoryVector(
   }
 }
 
-// supersede: 把 oldId 标 superseded，挂 supersedes_id / superseded_by_id 链，新条目进 active。
-// 同时同步 Vectorize：新条目 upsert 向量，旧条目 (superseded) 从向量下架 (向量库只索引 active)。
+// supersede: 把 oldId 标 superseded，新条目进 active，supersede 链挂侧车表。
+// memories 只改 status；侧车表记 supersedes_id / superseded_by_id / review_reason。
+// 同时同步 Vectorize：新条目 upsert，旧条目下架 (向量库只索引 active)。
 export async function supersedeMemory(
   env: Env,
   input: { namespace: string; oldId: string; newContent: string; newType?: string; newFactKey?: string | null; validAsOf?: string | null; reason?: string | null }
@@ -448,44 +483,40 @@ export async function supersedeMemory(
   const nextVectorId = `mem_${nextId}`;
   const newFactKey = input.newFactKey ?? null;
 
-  // 顺序很重要：先把 old 标 superseded，再插新 active。
-  // 否则若 newFactKey 与 old 的 fact_key 相同，partial unique index
-  // (WHERE status='active') 会因为 old 还 active 而挡住新条目插入。
+  // 1. 旧条目标 superseded (memories 本体只改 status)
+  await db
+    .prepare("UPDATE memories SET status = 'superseded', updated_at = ? WHERE id = ?")
+    .bind(now, old.id)
+    .run();
+  // 旧条目侧车行记 superseded_by_id + review_reason
   await db
     .prepare(
-      `UPDATE memories SET status = 'superseded', superseded_by_id = ?, review_reason = ?, updated_at = ?
-       WHERE id = ?`
+      `UPDATE memory_lifecycle SET superseded_by_id = ?, review_reason = ? WHERE memory_id = ?`
     )
-    .bind(nextId, input.reason ?? null, now, old.id)
+    .bind(nextId, input.reason ?? null, old.id)
     .run();
 
-  // 插新条目 (active)，挂 supersedes_id 指向 old，设 vector_id。
+  // 2. 插新条目 (memories 本体，v1 列)
   await db
     .prepare(
       `INSERT INTO memories (
         id, namespace, type, content, importance, confidence, status, pinned,
-        tags, source, source_message_ids, fact_key, valid_as_of, vector_id,
-        supersedes_id, review_reason,
-        last_seen_at, seen_count, created_at, updated_at, expires_at
-      ) VALUES (?, ?, ?, ?, 0.6, 0.8, 'active', 0, '[]', 'supersede', '[]', ?, ?, ?, ?, ?, ?, 0, ?, ?, null)`
+        tags, source, source_message_ids, vector_id, created_at, updated_at, expires_at
+      ) VALUES (?, ?, ?, ?, 0.6, 0.8, 'active', 0, '[]', 'supersede', '[]', ?, ?, ?, null)`
     )
-    .bind(
-      nextId,
-      input.namespace,
-      input.newType ?? "world_fact",
-      input.newContent,
-      newFactKey,
-      input.validAsOf ?? null,
-      nextVectorId,
-      old.id,
-      input.reason ?? null,
-      now,
-      now,
-      now
+    .bind(nextId, input.namespace, input.newType ?? "world_fact", input.newContent, nextVectorId, now, now)
+    .run();
+  // 新条目侧车行记 supersedes_id + fact_key + valid_as_of
+  await db
+    .prepare(
+      `INSERT INTO memory_lifecycle (
+        memory_id, namespace, fact_key, supersedes_id, review_reason, valid_as_of, last_seen_at, seen_count, last_injected_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL)`
     )
+    .bind(nextId, input.namespace, newFactKey, old.id, input.reason ?? null, input.validAsOf ?? null, now)
     .run();
 
-  // 同步向量：新条目 upsert，旧条目下架 (向量库只索引 active)。
+  // 3. 同步向量：新条目 upsert，旧条目下架
   await syncMemoryVector(env, { namespace: input.namespace, id: nextId });
   if (old.vector_id) {
     try {
@@ -527,7 +558,7 @@ export async function archiveMemory(
   return true;
 }
 
-// hard delete: D1 + 向量都删 (区别于 archive 软下架)。memory_delete 在 v2 开时用。
+// hard delete: D1 (本体+侧车) + 向量都删。memory_delete 在 v2 开时用。
 export async function deleteMemoryV2(
   env: Env,
   input: { namespace: string; id: string }
@@ -550,6 +581,7 @@ export async function deleteMemoryV2(
     }
   }
 
+  await db.prepare("DELETE FROM memory_lifecycle WHERE memory_id = ?").bind(input.id).run();
   await db
     .prepare("DELETE FROM memories WHERE namespace = ? AND id = ?")
     .bind(input.namespace, input.id)
@@ -558,7 +590,7 @@ export async function deleteMemoryV2(
 }
 
 // =====================================================================
-// memories v2: 闸三 last_injected_at 降权记账
+// memories v2: 闸三 last_injected_at 降权记账 (写侧车表)
 // =====================================================================
 
 export async function markMemoriesInjected(
@@ -567,11 +599,22 @@ export async function markMemoriesInjected(
 ): Promise<void> {
   if (input.ids.length === 0) return;
   const placeholders = input.ids.map(() => "?").join(", ");
+  // 没有侧车行的 memory_id 用 INSERT OR IGNORE 自动建一行 (只有 last_injected_at)。
+  // 这样老 v1 记忆第一次被注入也能记账。
+  for (const id of input.ids) {
+    await db
+      .prepare(
+        `INSERT OR IGNORE INTO memory_lifecycle (memory_id, namespace, seen_count, last_injected_at)
+         VALUES (?, ?, 0, ?)`
+      )
+      .bind(id, input.namespace, nowIso())
+      .run();
+  }
   await db
     .prepare(
-      `UPDATE memories SET last_injected_at = ? WHERE namespace = ? AND id IN (${placeholders})`
+      `UPDATE memory_lifecycle SET last_injected_at = ? WHERE memory_id IN (${placeholders})`
     )
-    .bind(nowIso(), input.namespace, ...input.ids)
+    .bind(nowIso(), ...input.ids)
     .run();
 }
 
@@ -580,13 +623,16 @@ export async function listActiveMemories(
   input: { namespace: string; type?: string; limit: number }
 ): Promise<Array<{ id: string; content: string; type: string; fact_key: string | null; importance: number; last_injected_at: string | null }>> {
   const limit = Math.min(Math.max(Math.floor(input.limit), 1), 200);
-  let sql = "SELECT id, content, type, fact_key, importance, last_injected_at FROM memories WHERE namespace = ? AND status = 'active'";
+  let sql = `SELECT m.id, m.content, m.type, lc.fact_key, m.importance, lc.last_injected_at
+             FROM memories m
+             LEFT JOIN memory_lifecycle lc ON lc.memory_id = m.id
+             WHERE m.namespace = ? AND m.status = 'active'`;
   const binds: unknown[] = [input.namespace];
   if (input.type) {
-    sql += " AND type = ?";
+    sql += " AND m.type = ?";
     binds.push(input.type);
   }
-  sql += " ORDER BY pinned DESC, importance DESC, updated_at DESC LIMIT ?";
+  sql += " ORDER BY m.pinned DESC, m.importance DESC, m.updated_at DESC LIMIT ?";
   binds.push(limit);
   const result = await db.prepare(sql).bind(...binds).all();
   return (result.results ?? []) as Array<{ id: string; content: string; type: string; fact_key: string | null; importance: number; last_injected_at: string | null }>;
