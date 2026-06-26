@@ -109,3 +109,16 @@ CREATE TABLE IF NOT EXISTS longtail (
 
 CREATE INDEX IF NOT EXISTS idx_longtail_namespace_ts
 ON longtail(namespace, ts);
+
+-- =====================================================================
+-- 昨天日志 (dream 每天跑完写一条，boot 冷启动取"昨天"那条)
+-- 每 namespace + date 一行，覆盖式写 (同天重跑 dream 会覆盖)。
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS daily_log (
+  namespace TEXT NOT NULL,
+  date TEXT NOT NULL,
+  title TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (namespace, date)
+);

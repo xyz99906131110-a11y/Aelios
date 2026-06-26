@@ -637,3 +637,68 @@ export async function listActiveMemories(
   const result = await db.prepare(sql).bind(...binds).all();
   return (result.results ?? []) as Array<{ id: string; content: string; type: string; fact_key: string | null; importance: number; last_injected_at: string | null }>;
 }
+
+// =====================================================================
+// 昨天日志 daily_log (dream 每天写一条，boot 读"昨天")
+// =====================================================================
+
+export interface DailyLogRow {
+  namespace: string;
+  date: string;
+  title: string;
+  summary: string;
+  updated_at: string;
+}
+
+export async function getDailyLog(
+  db: D1Database,
+  input: { namespace: string; date: string }
+): Promise<DailyLogRow | null> {
+  const row = await db
+    .prepare("SELECT namespace, date, title, summary, updated_at FROM daily_log WHERE namespace = ? AND date = ?")
+    .bind(input.namespace, input.date)
+    .first<DailyLogRow>();
+  return row ?? null;
+}
+
+export async function upsertDailyLog(
+  db: D1Database,
+  input: { namespace: string; date: string; title: string; summary: string }
+): Promise<DailyLogRow> {
+  const now = nowIso();
+  await db
+    .prepare(
+      `INSERT INTO daily_log (namespace, date, title, summary, updated_at) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(namespace, date) DO UPDATE SET title = excluded.title, summary = excluded.summary, updated_at = excluded.updated_at`
+    )
+    .bind(input.namespace, input.date, input.title, input.summary, now)
+    .run();
+  return { namespace: input.namespace, date: input.date, title: input.title, summary: input.summary, updated_at: now };
+}
+
+// =====================================================================
+// longtail 向量同步 (dream 种向量用)
+// =====================================================================
+
+export async function upsertLongtailEmbedding(
+  env: Env,
+  input: { id: string; namespace: string; content: string }
+): Promise<void> {
+  if (!env.VECTORIZE) return;
+  const { createEmbedding } = await import("../memory/embedding");
+  const vector = await createEmbedding(env, input.content);
+  if (!vector) return;
+  await env.VECTORIZE.upsert([
+    {
+      id: `lt_${input.id}`,
+      namespace: input.namespace,
+      values: vector,
+      metadata: {
+        namespace: input.namespace,
+        kind: "longtail",
+        ref_id: input.id,
+        content: input.content
+      }
+    }
+  ]);
+}

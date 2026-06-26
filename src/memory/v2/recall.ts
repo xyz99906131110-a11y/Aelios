@@ -12,6 +12,7 @@
 
 import {
   getDigest,
+  getDailyLog,
   listPrecious,
   listGlossary,
   matchGlossary,
@@ -173,9 +174,17 @@ export async function buildBootPackage(
     });
   }
 
+  // 昨天的日志 (dream 产出)
+  const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const yesterdayLabel = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Singapore",
+    year: "numeric", month: "2-digit", day: "2-digit"
+  }).format(yesterday);
+  const dailyLog = await getDailyLog(env.DB, { namespace: input.namespace, date: yesterdayLabel });
+
   return {
     digest: digest ? { content: digest.content, updated_at: digest.updated_at } : null,
-    yesterday_log: null, // 第 4 步 dream 生成后填
+    yesterday_log: dailyLog ? { date: dailyLog.date, title: dailyLog.title, summary: dailyLog.summary } : null,
     precious,
     glossary: allGlossary,
     schema_version: BOOT_SCHEMA_VERSION

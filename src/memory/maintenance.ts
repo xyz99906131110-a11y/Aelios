@@ -10,7 +10,7 @@ import {
   setProcessingCursor,
 } from "../db/conversations";
 import { extractMemoriesFromMessages, type ExtractedMemory } from "./extract";
-import { persistMemoryWithMerge } from "./merge";
+import { persistMemoryWithMerge, persistMemoryWithFactKey } from "./merge";
 import type { Env, MemoryMaintenanceQueueMessage, MessageRecord } from "../types";
 
 const EXTRACT_BATCH_SIZE = 50;
@@ -129,6 +129,31 @@ export async function runMemoryMaintenance(
     }
 
     const extraction = await extractMemoriesFromMessages(env, batch);
+    const writeMode = env.MEMORY_WRITE_MODE || "append";
+
+    for (const memory of extraction.memories) {
+      if (memory.importance < getMinImportance(env)) continue;
+      if (memory.confidence < 0.6) continue;
+      if (await isDuplicateMemory(env, { namespace: message.namespace, memory })) continue;
+
+      if (writeMode === "upsert" && memory.fact_key) {
+        await persistMemoryWithFactKey(env, {
+          namespace: message.namespace,
+          memory,
+          source: message.source,
+          sourceMessageIds: memory.source_message_ids,
+          factKey: memory.fact_key
+        });
+      } else {
+        await persistMemoryWithMerge(env, {
+          namespace: message.namespace,
+          memory,
+          source: message.source,
+          sourceMessageIds: memory.source_message_ids
+        });
+      }
+    }
+
     const summaryContent = extraction.summary_patch || buildBatchSummary(batch);
     if (summaryContent) {
       const summaryMemory: ExtractedMemory = {

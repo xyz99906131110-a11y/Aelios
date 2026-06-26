@@ -10,6 +10,16 @@ import {
   listVectorMemories,
   updateVectorMemory
 } from "./vectorStore";
+import { isV2Enabled } from "./v2/recall";
+import {
+  upsertMemoryByFactKey,
+  supersedeMemory,
+  upsertDigest,
+  createLongtail,
+  upsertDailyLog,
+  fetchMemoryLifecycleRows,
+  upsertLongtailEmbedding
+} from "../db/v2";
 
 interface DigestMemoryUpdate {
   target_id: string;
@@ -99,6 +109,12 @@ function isDreamEnabled(env: Env): boolean {
   const dreamFlag = readString(env.ENABLE_DREAM);
   if (dreamFlag) return dreamFlag !== "false";
   return env.ENABLE_DAILY_MEMORY_DIGEST !== "false";
+}
+
+function readDreamStrategy(env: Env): "legacy" | "upsert" | "review" {
+  const raw = env.DREAM_STRATEGY;
+  if (raw === "upsert" || raw === "review") return raw;
+  return "legacy";
 }
 
 function readFirstEnvValue(...values: unknown[]): unknown {
@@ -296,7 +312,8 @@ function normalizeExtractedMemory(value: unknown): ExtractedMemory | null {
     importance: clampScore(raw.importance, 0.7),
     confidence: clampScore(raw.confidence, 0.82),
     tags: readStringArray(raw.tags),
-    source_message_ids: readStringArray(raw.source_message_ids)
+    source_message_ids: readStringArray(raw.source_message_ids),
+    fact_key: typeof raw.fact_key === "string" && raw.fact_key.trim() ? raw.fact_key.trim() : undefined
   };
 }
 
@@ -661,6 +678,132 @@ async function applyMemoryUpdates(
   return { updated, deleted };
 }
 
+async function applyDreamV2(
+  env: Env,
+  input: {
+    namespace: string;
+    strategy: "upsert" | "review";
+    dateLabel: string;
+    messages: MessageRecord[];
+    digest: DailyDigestResult;
+    messageIds: string[];
+  }
+): Promise<{ added: number; updated: number; deleted: number; excerpts: number; longtail: number }> {
+  const { namespace, strategy, dateLabel, digest, messageIds } = input;
+  const isReview = strategy === "review";
+  let added = 0, updated = 0, deleted = 0, longtailCount = 0;
+
+  for (const memory of digest.memories_to_add ?? []) {
+    const factKey = memory.fact_key ?? null;
+    if (factKey) {
+      const result = await upsertMemoryByFactKey(env, {
+        namespace,
+        factKey,
+        content: memory.content,
+        type: memory.type,
+        importance: memory.importance,
+        confidence: memory.confidence,
+        tags: memory.tags,
+        source: "dream",
+        sourceMessageIds: memory.source_message_ids.length ? memory.source_message_ids : messageIds
+      });
+      if (result.created) {
+        added++;
+        if (isReview) {
+          await env.DB.prepare(
+            "UPDATE memory_lifecycle SET review_reason = ? WHERE memory_id = ?"
+          ).bind("dream_proposal", result.id).run();
+        }
+      }
+    } else {
+      const saved = await createVectorMemory(env, {
+        namespace,
+        type: memory.type,
+        content: memory.content,
+        importance: memory.importance,
+        confidence: memory.confidence,
+        tags: memory.tags,
+        source: "dream",
+        sourceMessageIds: memory.source_message_ids.length ? memory.source_message_ids : messageIds
+      });
+      if (saved) added++;
+    }
+  }
+
+  for (const item of digest.memories_to_update ?? []) {
+    const existing = await getVectorMemory(env, item.target_id);
+    if (!existing || existing.namespace !== namespace || existing.status !== "active") continue;
+
+    const lifecycleRows = await fetchMemoryLifecycleRows(env.DB, [existing.id]);
+    const existingFactKey = lifecycleRows[0]?.fact_key ?? null;
+
+    if (existingFactKey && item.content) {
+      await upsertMemoryByFactKey(env, {
+        namespace,
+        factKey: existingFactKey,
+        content: item.content,
+        type: item.type,
+        importance: item.importance,
+        confidence: item.confidence,
+        tags: item.tags,
+        source: "dream",
+        sourceMessageIds: messageIds
+      });
+      updated++;
+    } else if (item.content) {
+      await supersedeMemory(env, {
+        namespace,
+        oldId: item.target_id,
+        newContent: item.content,
+        newType: item.type,
+        reason: isReview ? "dream_review_proposal" : "dream_update"
+      });
+      updated++;
+    }
+  }
+
+  for (const item of digest.memories_to_delete ?? []) {
+    const existing = await getVectorMemory(env, item.target_id);
+    if (!existing || existing.status !== "active" || existing.pinned) continue;
+
+    const lt = await createLongtail(env.DB, { namespace, content: existing.content, sourceMessageIds: messageIds });
+    await upsertLongtailEmbedding(env, { id: lt.id, namespace, content: existing.content });
+    longtailCount++;
+
+    await deleteVectorMemory(env, item.target_id);
+    deleted++;
+  }
+
+  const excerpts = await saveImportantExcerpts(env, {
+    namespace,
+    dateLabel,
+    excerpts: digest.important_excerpts ?? [],
+    fallbackMessageIds: messageIds
+  });
+
+  if (!isReview && digest.summary) {
+    const digestContent = [
+      digest.title ? `【${digest.title}】` : "",
+      digest.summary,
+      ...(digest.sections ?? []).map((s) => (s.heading ? `${s.heading}: ${s.content}` : s.content ?? ""))
+    ]
+      .filter(Boolean)
+      .join("\n");
+    await upsertDigest(env.DB, { namespace, content: digestContent });
+  }
+
+  if (!isReview) {
+    await upsertDailyLog(env.DB, {
+      namespace,
+      date: dateLabel,
+      title: digest.title ?? dateLabel,
+      summary: digest.summary ?? ""
+    });
+  }
+
+  return { added, updated, deleted, excerpts, longtail: longtailCount };
+}
+
 export async function runDailyMemoryDigest(
   env: Env,
   namespace: string,
@@ -743,6 +886,38 @@ export async function runDailyMemoryDigest(
     };
   }
   const messageIds = messages.map((message) => message.id);
+
+  const strategy = readDreamStrategy(env);
+
+  // v2 path: fact_key upsert + L1 digest + longtail + yesterday_log
+  if (isV2Enabled(env) && strategy !== "legacy") {
+    const v2Result = await applyDreamV2(env, {
+      namespace,
+      strategy,
+      dateLabel,
+      messages,
+      digest,
+      messageIds
+    });
+
+    await writeCursor(env.DB, cursorName, hasMore ? lastMessage.created_at : `done:${lastMessage.created_at}`);
+
+    return {
+      ran: true,
+      stats: {
+        date: dateLabel,
+        mode: "dream",
+        processedMessages: messages.length,
+        addedMemories: v2Result.added,
+        updatedMemories: v2Result.updated,
+        deletedMemories: v2Result.deleted,
+        savedExcerpts: v2Result.excerpts,
+        cleanedEmptyMemories,
+        cursorAdvanced: true,
+        hasMore
+      }
+    };
+  }
 
   const updates = await applyMemoryUpdates(env, {
     namespace,

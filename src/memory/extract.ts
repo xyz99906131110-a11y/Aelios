@@ -8,6 +8,7 @@ export interface ExtractedMemory {
   confidence: number;
   tags: string[];
   source_message_ids: string[];
+  fact_key?: string;  // v2: model can provide fact_key for upsert dedup
 }
 
 export interface MemoryExtractionResult {
@@ -97,6 +98,7 @@ function parseExtraction(text: string): MemoryExtractionResult {
         confidence?: unknown;
         tags?: unknown;
         source_message_ids?: unknown;
+        fact_key?: unknown;
       };
 
       const content = normalizeMemoryContent(record.content);
@@ -109,7 +111,8 @@ function parseExtraction(text: string): MemoryExtractionResult {
           importance: normalizeNumber(record.importance, 0.5),
           confidence: normalizeNumber(record.confidence, 0.8),
           tags: normalizeStringArray(record.tags),
-          source_message_ids: normalizeStringArray(record.source_message_ids)
+          source_message_ids: normalizeStringArray(record.source_message_ids),
+          fact_key: typeof record.fact_key === "string" && record.fact_key.trim() ? record.fact_key.trim() : undefined
         }
       ];
     })
