@@ -11,6 +11,7 @@ import {
 } from "../db/conversations";
 import { extractMemoriesFromMessages, type ExtractedMemory } from "./extract";
 import { persistMemoryWithMerge, persistMemoryWithFactKey } from "./merge";
+import { isV2Enabled } from "./v2/recall";
 import type { Env, MemoryMaintenanceQueueMessage, MessageRecord } from "../types";
 
 const EXTRACT_BATCH_SIZE = 50;
@@ -129,7 +130,7 @@ export async function runMemoryMaintenance(
     }
 
     const extraction = await extractMemoriesFromMessages(env, batch);
-    const writeMode = env.MEMORY_WRITE_MODE || "append";
+    const writeMode = isV2Enabled(env) ? env.MEMORY_WRITE_MODE || "append" : "append";
 
     for (const memory of extraction.memories) {
       if (memory.importance < getMinImportance(env)) continue;
