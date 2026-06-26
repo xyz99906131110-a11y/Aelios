@@ -6,6 +6,7 @@ import {
   archiveMemory,
   createPrecious,
   deleteMemoryV2,
+  fetchMemoryLifecycleRows,
   getDigest,
   getPreciousById,
   supersedeMemory,
@@ -396,8 +397,10 @@ async function callTool(
         limit,
         offset: readNonNegativeInt(args.offset ?? 0, 0, 1000000)
       });
+      const lifecycleRows = await fetchMemoryLifecycleRows(env.DB, page.records.map((r) => r.id));
+      const lifecycleByMemoryId = new Map(lifecycleRows.map((lc) => [lc.memory_id, lc]));
       return textToolResult({
-        data: page.records.map((r) => toMemoryApiRecord(r)),
+        data: page.records.map((r) => toMemoryApiRecord(r, undefined, lifecycleByMemoryId.get(r.id) ?? null)),
         paging: {
           limit,
           has_more: page.hasMore,
@@ -440,7 +443,8 @@ async function callTool(
         id
       });
       if (!record) return toolError("Memory not found");
-      return textToolResult({ data: toMemoryApiRecord(record) });
+      const lifecycleRows = await fetchMemoryLifecycleRows(env.DB, [record.id]);
+      return textToolResult({ data: toMemoryApiRecord(record, undefined, lifecycleRows[0] ?? null) });
     }
 
     const memory = await getVectorMemory(env, id);
