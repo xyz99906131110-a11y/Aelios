@@ -14,12 +14,15 @@ import { isV2Enabled } from "./v2/recall";
 import {
   upsertMemoryByFactKey,
   supersedeMemory,
+  archiveMemory,
   upsertDigest,
   createLongtail,
   upsertDailyLog,
   fetchMemoryLifecycleRows,
   upsertLongtailEmbedding
 } from "../db/v2";
+import { newId } from "../utils/ids";
+import { nowIso } from "../utils/time";
 
 interface DigestMemoryUpdate {
   target_id: string;
@@ -459,6 +462,7 @@ function buildDigestPrompt(input: {
     "- sections 最多 3 段，每段有 heading 和 content；没有必要可以给空数组。",
     `- important_excerpts 最多 ${input.excerptLimit} 条，quote 必须是值得保留的原文片段。`,
     "- memories_to_add 最多 8 条，每条要短、稳定、可复用。",
+    "- memories_to_add 里的稳定事实必须给 fact_key，格式用小写 ASCII 分组键，例如 project:aelios-memory-v2、preference:answer-style、relationship:boundary。没有稳定 key 才省略。",
     "- memories_to_update 只针对给出的旧记忆 id。",
     "- memories_to_delete 只删除空、重复、明显过期或被新信息否定的旧记忆。",
     "- 控制总输出长度，宁可少写也不要输出超长 JSON。",
@@ -484,6 +488,7 @@ function buildDigestPrompt(input: {
           importance: 0.86,
           confidence: 0.92,
           tags: ["project", "aelios"],
+          fact_key: "project:aelios-memory-v2",
           source_message_ids: ["msg_x"]
         }
       ],
@@ -594,6 +599,17 @@ async function callDigestModel(
   }
 }
 
+async function retireMemoryRecord(
+  env: Env,
+  input: { namespace: string; id: string }
+): Promise<boolean> {
+  if (isV2Enabled(env)) {
+    const archived = await archiveMemory(env, input);
+    if (archived) return true;
+  }
+  return deleteVectorMemory(env, input.id);
+}
+
 async function cleanEmptyMemories(
   env: Env,
   namespace: string
@@ -609,7 +625,7 @@ async function cleanEmptyMemories(
   const records = page.data.filter((record) => !record.pinned && record.content.trim().length < minChars);
 
   for (const record of records) {
-    await deleteVectorMemory(env, record.id);
+    await retireMemoryRecord(env, { namespace, id: record.id });
   }
 
   return records.length;
@@ -678,6 +694,34 @@ async function applyMemoryUpdates(
   return { updated, deleted };
 }
 
+async function recordDreamReviewProposal(
+  env: Env,
+  input: { namespace: string; dateLabel: string; digest: DailyDigestResult; messageIds: string[] }
+): Promise<void> {
+  await env.DB
+    .prepare(
+      `INSERT INTO memory_events (id, namespace, event_type, memory_id, payload_json, created_at)
+       VALUES (?, ?, ?, NULL, ?, ?)`
+    )
+    .bind(
+      newId("evt"),
+      input.namespace,
+      "dream_review_proposal",
+      JSON.stringify({
+        date: input.dateLabel,
+        message_ids: input.messageIds,
+        title: input.digest.title ?? null,
+        summary: input.digest.summary ?? null,
+        memories_to_add: input.digest.memories_to_add ?? [],
+        memories_to_update: input.digest.memories_to_update ?? [],
+        memories_to_delete: input.digest.memories_to_delete ?? [],
+        important_excerpts: input.digest.important_excerpts ?? []
+      }),
+      nowIso()
+    )
+    .run();
+}
+
 async function applyDreamV2(
   env: Env,
   input: {
@@ -692,6 +736,11 @@ async function applyDreamV2(
   const { namespace, strategy, dateLabel, digest, messageIds } = input;
   const isReview = strategy === "review";
   let added = 0, updated = 0, deleted = 0, longtailCount = 0;
+
+  if (isReview) {
+    await recordDreamReviewProposal(env, { namespace, dateLabel, digest, messageIds });
+    return { added: 0, updated: 0, deleted: 0, excerpts: 0, longtail: 0 };
+  }
 
   for (const memory of digest.memories_to_add ?? []) {
     const factKey = memory.fact_key ?? null;
@@ -770,8 +819,8 @@ async function applyDreamV2(
     await upsertLongtailEmbedding(env, { id: lt.id, namespace, content: existing.content });
     longtailCount++;
 
-    await deleteVectorMemory(env, item.target_id);
-    deleted++;
+    const retired = await retireMemoryRecord(env, { namespace, id: item.target_id });
+    if (retired) deleted++;
   }
 
   const excerpts = await saveImportantExcerpts(env, {
@@ -781,7 +830,7 @@ async function applyDreamV2(
     fallbackMessageIds: messageIds
   });
 
-  if (!isReview && digest.summary) {
+  if (digest.summary) {
     const digestContent = [
       digest.title ? `【${digest.title}】` : "",
       digest.summary,
@@ -792,14 +841,12 @@ async function applyDreamV2(
     await upsertDigest(env.DB, { namespace, content: digestContent });
   }
 
-  if (!isReview) {
-    await upsertDailyLog(env.DB, {
-      namespace,
-      date: dateLabel,
-      title: digest.title ?? dateLabel,
-      summary: digest.summary ?? ""
-    });
-  }
+  await upsertDailyLog(env.DB, {
+    namespace,
+    date: dateLabel,
+    title: digest.title ?? dateLabel,
+    summary: digest.summary ?? ""
+  });
 
   return { added, updated, deleted, excerpts, longtail: longtailCount };
 }
@@ -847,7 +894,9 @@ export async function runDailyMemoryDigest(
   } catch (error) {
     console.error("dream: failed to list existing vector memories", error);
   }
-  const cleanedEmptyMemories = await cleanEmptyMemories(env, namespace);
+  const strategy = readDreamStrategy(env);
+  const v2Enabled = isV2Enabled(env);
+  const cleanedEmptyMemories = v2Enabled && strategy === "review" ? 0 : await cleanEmptyMemories(env, namespace);
 
   const prompt = buildDigestPrompt({
     dateLabel,
@@ -887,10 +936,8 @@ export async function runDailyMemoryDigest(
   }
   const messageIds = messages.map((message) => message.id);
 
-  const strategy = readDreamStrategy(env);
-
   // v2 path: fact_key upsert + L1 digest + longtail + yesterday_log
-  if (isV2Enabled(env) && strategy !== "legacy") {
+  if (v2Enabled && strategy !== "legacy") {
     const v2Result = await applyDreamV2(env, {
       namespace,
       strategy,

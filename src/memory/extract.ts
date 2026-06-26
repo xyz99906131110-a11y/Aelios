@@ -145,6 +145,7 @@ function buildExtractionPrompt(messages: MessageRecord[]): string {
     "- 关于我的责任/承诺/互动方式，写成“我……”例如“我需要在回答时更直接”。",
     "- 不要写成第三人称报告腔，例如“用户表示……”“助手应该……”。",
     "- 每条 content 必须是未来对话可直接使用的自然短句。",
+    "- 稳定事实尽量给 fact_key，格式用小写 ASCII 分组键，例如 project:aelios、preference:answer-style、boundary:no-system-records。只有临时或无法归类的记忆才省略。",
     "",
     "不要保存：",
     "- 普通寒暄",
@@ -172,6 +173,7 @@ function buildExtractionPrompt(messages: MessageRecord[]): string {
           importance: 0.86,
           confidence: 0.94,
           tags: ["project", "cloudflare"],
+          fact_key: "project:cloudflare-memory-proxy",
           source_message_ids: ["msg_x"]
         },
         {
