@@ -1,7 +1,21 @@
 import { authenticate } from "../auth/apiKey";
 import { getOrCreateConversation } from "../db/conversations";
+import { fetchMemoriesByIds, getMemoryById, listMemoriesPage } from "../db/memories";
 import { saveIngestMessages } from "../db/messages";
+import {
+  archiveMemory,
+  createPrecious,
+  deleteMemoryV2,
+  getDigest,
+  getPreciousById,
+  supersedeMemory,
+  upsertDigest,
+  upsertGlossary,
+  upsertMemoryByFactKey
+} from "../db/v2";
 import { filterAndCompressMemories } from "../memory/filter";
+import { buildBootPackage, isV2Enabled, runRecall } from "../memory/v2/recall";
+import { toMemoryApiRecord } from "../memory/search";
 import {
   createVectorMemory,
   deleteVectorMemory,
@@ -16,6 +30,7 @@ import {
   isRecord,
   readBoolean,
   readMessages,
+  readNonNegativeInt,
   readNumber,
   readPositiveInt,
   readString,
@@ -125,6 +140,7 @@ function getTools(): Array<Record<string, unknown>> {
         properties: {
           limit: { type: "number", minimum: 1, maximum: 1000 },
           cursor: { type: "string" },
+          offset: { type: "number", minimum: 0 },
           include_ids: { type: "boolean" },
           type: { type: "string" },
           status: { type: "string" },
@@ -177,6 +193,143 @@ function getTools(): Array<Record<string, unknown>> {
           namespace: { type: "string" }
         },
         required: ["messages"]
+      }
+    },
+    // --- Aelios 记忆库 v2 端点 (母帖 #11 第 2 步) ---
+    // 全部走 MEMORY_LIFECYCLE_ENABLED 总闸；关时返回未启用。
+    {
+      name: "memory_boot",
+      description:
+        "Cold-start package: L1 digest + yesterday log + top pinned precious + all glossary. " +
+        "Output is stable and deterministically ordered so the client can cache it. " +
+        "Call once on SessionStart.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          namespace: { type: "string" }
+        }
+      }
+    },
+    {
+      name: "memory_recall",
+      description:
+        "Per-turn dynamic recall: glossary literal hits + memories(active) vector + world_fact " +
+        "+ longtail fallback. Gate 3 inject-decay on last_injected_at. Gate 2 dedups hits against " +
+        "the core layer (digest + precious) so the model isn't re-fed what it already knows this turn. " +
+        "Precious is NOT queried here (gate 1: it lives in boot). Call on UserPromptSubmit.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          query: { type: "string" },
+          k: { type: "number", minimum: 1, maximum: 100 },
+          types: { type: "array", items: { type: "string" } },
+          namespace: { type: "string" }
+        },
+        required: ["query"]
+      }
+    },
+    {
+      name: "memory_pin",
+      description: "Mark a memory as precious (L3, pinned, exempt from dedup/decay/delete). " +
+        "Store with surrounding context so a single line stays interpretable later.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          content: { type: "string" },
+          context_message_ids: { type: "array", items: { type: "string" } },
+          namespace: { type: "string" }
+        },
+        required: ["content"]
+      }
+    },
+    {
+      name: "glossary_set",
+      description: "Add or update a glossary term (L5, literal recall, not in vector index). " +
+        "Upsert by (namespace, term).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          term: { type: "string" },
+          aliases: { type: "array", items: { type: "string" } },
+          definition: { type: "string" },
+          examples: { type: "array", items: { type: "string" } },
+          namespace: { type: "string" }
+        },
+        required: ["term", "definition"]
+      }
+    },
+    {
+      name: "memory_upsert",
+      description:
+        "Assert/update a refined memory by fact_key (no waiting for dream). " +
+        "world_fact also uses this with type='world_fact'.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          fact_key: { type: "string" },
+          content: { type: "string" },
+          type: { type: "string" },
+          importance: { type: "number" },
+          confidence: { type: "number" },
+          tags: { type: "array", items: { type: "string" } },
+          source: { type: "string" },
+          valid_as_of: { type: "string" },
+          namespace: { type: "string" }
+        },
+        required: ["fact_key", "content"]
+      }
+    },
+    {
+      name: "memory_supersede",
+      description:
+        "Mark old_id as superseded and insert a new active entry, linking the supersede chain. " +
+        "Used for world_fact updates that invalidate older entries.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          old_id: { type: "string" },
+          new_content: { type: "string" },
+          new_type: { type: "string" },
+          new_fact_key: { type: "string" },
+          valid_as_of: { type: "string" },
+          reason: { type: "string" },
+          namespace: { type: "string" }
+        },
+        required: ["old_id", "new_content"]
+      }
+    },
+    {
+      name: "memory_archive",
+      description: "Soft-archive a memory (status='archived'). Does not touch the supersede chain.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          id: { type: "string" },
+          namespace: { type: "string" }
+        },
+        required: ["id"]
+      }
+    },
+    {
+      name: "digest_get",
+      description: "Read the L1 digest (single row per namespace, <=500 chars).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          namespace: { type: "string" }
+        }
+      }
+    },
+    {
+      name: "digest_set",
+      description: "Overwrite the L1 digest (covering write, <=500 chars).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          content: { type: "string" },
+          namespace: { type: "string" }
+        },
+        required: ["content"]
       }
     }
   ];
@@ -231,9 +384,31 @@ async function callTool(
   if (params.name === "memory_list") {
     if (!hasScope(profile, "memory:read")) return toolError("Missing memory:read scope");
     const limit = readPositiveInt(args.limit, 100, 1000);
+    const namespace = resolveNamespace(profile, args.namespace);
+
+    // v2: 走 D1 (本体)，能列出 fact_key upsert 写入的记录。
+    // v1: 走 Vectorize (向量是当时唯一存储)。
+    if (isV2Enabled(env)) {
+      const page = await listMemoriesPage(env.DB, {
+        namespace,
+        type: readString(args.type),
+        status: readString(args.status) ?? "active",
+        limit,
+        offset: readNonNegativeInt(args.offset ?? 0, 0, 1000000)
+      });
+      return textToolResult({
+        data: page.records.map((r) => toMemoryApiRecord(r)),
+        paging: {
+          limit,
+          has_more: page.hasMore,
+          next_offset: page.nextOffset
+        }
+      });
+    }
+
     try {
       const page = await listVectorMemories(env, {
-        namespace: resolveNamespace(profile, args.namespace),
+        namespace,
         count: limit,
         cursor: readString(args.cursor)
       });
@@ -257,6 +432,17 @@ async function callTool(
     if (!hasScope(profile, "memory:read")) return toolError("Missing memory:read scope");
     const id = readString(args.id);
     if (!id) return toolError("id is required");
+
+    // v2: 走 D1，能拿到 fact_key upsert / supersede 写入的记录。
+    if (isV2Enabled(env)) {
+      const record = await getMemoryById(env.DB, {
+        namespace: resolveNamespace(profile, args.namespace),
+        id
+      });
+      if (!record) return toolError("Memory not found");
+      return textToolResult({ data: toMemoryApiRecord(record) });
+    }
+
     const memory = await getVectorMemory(env, id);
     if (!memory) return toolError("Memory not found");
     return textToolResult({ data: memory });
@@ -266,6 +452,17 @@ async function callTool(
     if (!hasScope(profile, "memory:write")) return toolError("Missing memory:write scope");
     const id = readString(args.id);
     if (!id) return toolError("id is required");
+
+    // v2: 硬删 D1 + 向量 (本体和镜像一起删)，找不到返回 false。
+    if (isV2Enabled(env)) {
+      const deleted = await deleteMemoryV2(env, {
+        namespace: resolveNamespace(profile, args.namespace),
+        id
+      });
+      if (!deleted) return toolError("Memory not found");
+      return textToolResult({ data: { id, deleted: true } });
+    }
+
     await deleteVectorMemory(env, id);
     return textToolResult({
       data: {
@@ -311,6 +508,139 @@ async function callTool(
         auto_extract: args.auto_extract !== false
       }
     });
+  }
+
+  // --- Aelios 记忆库 v2 端点 (母帖 #11 第 2 步) ---
+  // 全部走 MEMORY_LIFECYCLE_ENABLED 总闸；关时返回未启用，不碰 v2 表。
+
+  if (params.name === "memory_boot") {
+    if (!hasScope(profile, "memory:read")) return toolError("Missing memory:read scope");
+    if (!isV2Enabled(env)) return toolError("memory_boot requires MEMORY_LIFECYCLE_ENABLED=true");
+    const pkg = await buildBootPackage(env, {
+      namespace: resolveNamespace(profile, args.namespace)
+    });
+    return textToolResult({ data: pkg });
+  }
+
+  if (params.name === "memory_recall") {
+    if (!hasScope(profile, "memory:read")) return toolError("Missing memory:read scope");
+    if (!isV2Enabled(env)) return toolError("memory_recall requires MEMORY_LIFECYCLE_ENABLED=true");
+    const query = readString(args.query);
+    if (!query) return toolError("query is required");
+    const result = await runRecall(env, {
+      namespace: resolveNamespace(profile, args.namespace),
+      query,
+      k: readNumber(args.k, 20),
+      types: readStringArray(args.types)
+    });
+    return textToolResult({ data: result });
+  }
+
+  if (params.name === "memory_pin") {
+    if (!hasScope(profile, "memory:write")) return toolError("Missing memory:write scope");
+    if (!isV2Enabled(env)) return toolError("memory_pin requires MEMORY_LIFECYCLE_ENABLED=true");
+    const content = readString(args.content);
+    if (!content) return toolError("content is required");
+    const precious = await createPrecious(env.DB, {
+      namespace: resolveNamespace(profile, args.namespace),
+      content,
+      contextMessageIds: readStringArray(args.context_message_ids)
+    });
+    return textToolResult({ data: precious });
+  }
+
+  if (params.name === "glossary_set") {
+    if (!hasScope(profile, "memory:write")) return toolError("Missing memory:write scope");
+    if (!isV2Enabled(env)) return toolError("glossary_set requires MEMORY_LIFECYCLE_ENABLED=true");
+    const term = readString(args.term);
+    const definition = readString(args.definition);
+    if (!term) return toolError("term is required");
+    if (!definition) return toolError("definition is required");
+    const row = await upsertGlossary(env.DB, {
+      namespace: resolveNamespace(profile, args.namespace),
+      term,
+      aliases: readStringArray(args.aliases),
+      definition,
+      examples: readStringArray(args.examples)
+    });
+    return textToolResult({ data: row });
+  }
+
+  if (params.name === "memory_upsert") {
+    if (!hasScope(profile, "memory:write")) return toolError("Missing memory:write scope");
+    if (!isV2Enabled(env)) return toolError("memory_upsert requires MEMORY_LIFECYCLE_ENABLED=true");
+    const factKey = readString(args.fact_key);
+    const content = readString(args.content);
+    if (!factKey) return toolError("fact_key is required");
+    if (!content) return toolError("content is required");
+    const result = await upsertMemoryByFactKey(env, {
+      namespace: resolveNamespace(profile, args.namespace),
+      factKey,
+      content,
+      type: readString(args.type) || "fact",
+      importance: readNumber(args.importance, 0.6),
+      confidence: readNumber(args.confidence, 0.8),
+      tags: readStringArray(args.tags),
+      source: readString(args.source) || "mcp",
+      validAsOf: readString(args.valid_as_of)
+    });
+    return textToolResult({ data: result });
+  }
+
+  if (params.name === "memory_supersede") {
+    if (!hasScope(profile, "memory:write")) return toolError("Missing memory:write scope");
+    if (!isV2Enabled(env)) return toolError("memory_supersede requires MEMORY_LIFECYCLE_ENABLED=true");
+    const oldId = readString(args.old_id);
+    const newContent = readString(args.new_content);
+    if (!oldId) return toolError("old_id is required");
+    if (!newContent) return toolError("new_content is required");
+    try {
+      const result = await supersedeMemory(env, {
+        namespace: resolveNamespace(profile, args.namespace),
+        oldId,
+        newContent,
+        newType: readString(args.new_type) || "world_fact",
+        newFactKey: readString(args.new_fact_key),
+        validAsOf: readString(args.valid_as_of),
+        reason: readString(args.reason)
+      });
+      return textToolResult({ data: result });
+    } catch (error) {
+      return toolError(error instanceof Error ? error.message : "memory_supersede failed");
+    }
+  }
+
+  if (params.name === "memory_archive") {
+    if (!hasScope(profile, "memory:write")) return toolError("Missing memory:write scope");
+    if (!isV2Enabled(env)) return toolError("memory_archive requires MEMORY_LIFECYCLE_ENABLED=true");
+    const id = readString(args.id);
+    if (!id) return toolError("id is required");
+    const archived = await archiveMemory(env, {
+      namespace: resolveNamespace(profile, args.namespace),
+      id
+    });
+    if (!archived) return toolError("Memory not found");
+    return textToolResult({ data: { id, archived: true } });
+  }
+
+  if (params.name === "digest_get") {
+    if (!hasScope(profile, "memory:read")) return toolError("Missing memory:read scope");
+    if (!isV2Enabled(env)) return toolError("digest_get requires MEMORY_LIFECYCLE_ENABLED=true");
+    const row = await getDigest(env.DB, resolveNamespace(profile, args.namespace));
+    return textToolResult({ data: row });
+  }
+
+  if (params.name === "digest_set") {
+    if (!hasScope(profile, "memory:write")) return toolError("Missing memory:write scope");
+    if (!isV2Enabled(env)) return toolError("digest_set requires MEMORY_LIFECYCLE_ENABLED=true");
+    const content = readString(args.content);
+    if (!content) return toolError("content is required");
+    if (content.length > 500) return toolError("digest content must be <= 500 chars (L1 摘要字数自检)");
+    const row = await upsertDigest(env.DB, {
+      namespace: resolveNamespace(profile, args.namespace),
+      content
+    });
+    return textToolResult({ data: row });
   }
 
   return toolError(`Unknown tool: ${String(params.name || "")}`);

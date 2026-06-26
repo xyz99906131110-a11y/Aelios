@@ -34,6 +34,15 @@ export function toMemoryApiRecord(record: MemoryRecord, score?: number): MemoryA
     created_at: record.created_at,
     updated_at: record.updated_at,
     expires_at: record.expires_at,
+    // v2 字段 (母帖 #11)：闸三降权靠 last_injected_at，supersede 链靠 supersedes_*。
+    fact_key: record.fact_key ?? null,
+    supersedes_id: record.supersedes_id ?? null,
+    superseded_by_id: record.superseded_by_id ?? null,
+    review_reason: record.review_reason ?? null,
+    valid_as_of: record.valid_as_of ?? null,
+    last_seen_at: record.last_seen_at ?? null,
+    seen_count: record.seen_count ?? 0,
+    last_injected_at: record.last_injected_at ?? null,
     ...(score === undefined ? {} : { score })
   };
 }
