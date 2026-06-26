@@ -93,29 +93,41 @@ export function assembledToAnthropicSystem(
  * since Anthropic text blocks cannot represent image_url natively.
  * For null content: empty text block.
  */
+/**
+ * Convert assembled messages to Anthropic wire format, merging consecutive
+ * same-role messages. Returns both the wire messages and a mapping from
+ * original (assembled) message indices to wire message indices, so that
+ * cache breakpoints can be applied to the correct wire message even after
+ * merging.
+ */
 export function assembledToAnthropicMessages(
   messages: AssembledPrompt["messages"]
-): AnthropicWireMessage[] {
-  const result: AnthropicWireMessage[] = [];
+): { wire: AnthropicWireMessage[]; indexMap: Map<number, number> } {
+  const wire: AnthropicWireMessage[] = [];
+  const indexMap = new Map<number, number>();
 
-  for (const msg of messages) {
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
     const role = msg.role;
     const text = contentToPlainText(msg.content);
 
-    const prev = result[result.length - 1];
+    const prev = wire[wire.length - 1];
     if (prev?.role === role) {
       prev.content.push({ type: "text", text });
+      // This original message merges into the same wire message as the previous
+      indexMap.set(i, wire.length - 1);
       continue;
     }
 
-    result.push({ role, content: [{ type: "text", text }] });
+    wire.push({ role, content: [{ type: "text", text }] });
+    indexMap.set(i, wire.length - 1);
   }
 
-  if (result.length === 0) {
-    result.push({ role: "user", content: [{ type: "text", text: "" }] });
+  if (wire.length === 0) {
+    wire.push({ role: "user", content: [{ type: "text", text: "" }] });
   }
 
-  return result;
+  return { wire, indexMap };
 }
 
 // ---------------------------------------------------------------------------
@@ -127,17 +139,22 @@ export function assembledToAnthropicMessages(
  *
  * "system" targets are handled by assembledToAnthropicSystem (already in
  * SystemBlock.cache_control). This function handles "message" targets:
- * it stamps cache_control on the last content block of messages[msgIdx].
+ * it stamps cache_control on the last content block of the wire message
+ * corresponding to the assembled message at breakpoint.message_index,
+ * using the index mapping produced by assembledToAnthropicMessages.
  */
 export function applyMessageCacheBreakpoints(
-  messages: AnthropicWireMessage[],
+  wireMessages: AnthropicWireMessage[],
   breakpoints: CacheBreakpoint[],
+  indexMap: Map<number, number>,
   cacheControl: { type: "ephemeral"; ttl?: "5m" | "1h" }
 ): void {
   for (const bp of breakpoints) {
     if (bp.target !== "message") continue;
     if (bp.message_index == null) continue;
-    const msg = messages[bp.message_index];
+    const wireIdx = indexMap.get(bp.message_index);
+    if (wireIdx == null) continue;
+    const msg = wireMessages[wireIdx];
     if (!msg || msg.content.length === 0) continue;
     const lastBlock = msg.content[msg.content.length - 1];
     if (lastBlock.type === "text") {

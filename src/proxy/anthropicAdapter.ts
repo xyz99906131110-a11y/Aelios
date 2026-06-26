@@ -119,7 +119,8 @@ export function getAnthropicCacheMode(env: Env): string | null {
  */
 function applyExplicitCacheBreakpoints(
   systemBlocks: AnthropicTextBlock[],
-  messages: AnthropicWireMessage[],
+  wireMessages: AnthropicWireMessage[],
+  indexMap: Map<number, number>,
   assembled: AssembledPrompt,
   env: Env
 ): void {
@@ -137,8 +138,8 @@ function applyExplicitCacheBreakpoints(
     }
   }
 
-  // Apply message-level breakpoints
-  applyMessageCacheBreakpoints(messages, assembled.meta.cache_breakpoints, cc);
+  // Apply message-level breakpoints using the original→wire index mapping
+  applyMessageCacheBreakpoints(wireMessages, assembled.meta.cache_breakpoints, indexMap, cc);
 }
 
 // ---------------------------------------------------------------------------
@@ -563,10 +564,10 @@ export function buildAnthropicRequestFromAssembled(
 
   const { systemBlocks, dynamicMemoryPatch } = splitDynamicMemorySystemBlock(assembled);
   const system = assembledToAnthropicSystem(systemBlocks);
-  const messages = assembledToAnthropicMessages(assembled.messages);
+  const { wire: messages, indexMap } = assembledToAnthropicMessages(assembled.messages);
 
   // Apply explicit cache breakpoints (history_read_anchor + forward_write_anchor)
-  applyExplicitCacheBreakpoints(system, messages, assembled, env);
+  applyExplicitCacheBreakpoints(system, messages, indexMap, assembled, env);
 
   // Rolling cache: off by default, opt-in
   if (env.ANTHROPIC_ROLLING_CACHE_ENABLED === "true") {
