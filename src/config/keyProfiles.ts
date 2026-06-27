@@ -22,7 +22,7 @@ export const KEY_PROFILES = {
   debug: {
     source: "debug",
     namespace: "default",
-    scopes: ["chat:proxy", "memory:read", "memory:write", "cache:read", "cache:write", "debug:read"],
+    scopes: ["chat:proxy", "memory:read", "memory:write", "cache:read", "cache:write", "debug:read", "export:read"],
     injectionMode: "full",
     memoryMode: "hybrid",
     allowModelPassthrough: true,
@@ -31,7 +31,7 @@ export const KEY_PROFILES = {
   mcp: {
     source: "mcp",
     namespace: "default",
-    scopes: ["memory:read", "memory:write"],
+    scopes: ["memory:read", "memory:write", "export:read"],
     injectionMode: "none",
     memoryMode: "builtin",
     allowModelPassthrough: false,

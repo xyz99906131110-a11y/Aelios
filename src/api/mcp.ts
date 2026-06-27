@@ -15,6 +15,7 @@ import {
   upsertMemoryByFactKey
 } from "../db/v2";
 import { filterAndCompressMemories } from "../memory/filter";
+import { exportMemories } from "../memory/export";
 import { buildBootPackage, isV2Enabled, runRecall } from "../memory/v2/recall";
 import { toMemoryApiRecord } from "../memory/search";
 import {
@@ -145,6 +146,18 @@ function getTools(): Array<Record<string, unknown>> {
           include_ids: { type: "boolean" },
           type: { type: "string" },
           status: { type: "string" },
+          namespace: { type: "string" }
+        }
+      }
+    },
+    {
+      name: "memory_export",
+      description: "Bulk export memory records as JSON, including content and metadata.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          type: { type: "string" },
+          format: { type: "string", enum: ["json"] },
           namespace: { type: "string" }
         }
       }
@@ -428,6 +441,21 @@ async function callTool(
       });
     } catch (error) {
       return toolError(error instanceof Error ? error.message : "memory_list failed");
+    }
+  }
+
+  if (params.name === "memory_export") {
+    if (!hasScope(profile, "memory:read")) return toolError("Missing memory:read scope");
+    if (!hasScope(profile, "export:read")) return toolError("Missing export:read scope");
+    try {
+      const result = await exportMemories(env, {
+        namespace: resolveNamespace(profile, args.namespace),
+        type: readString(args.type),
+        format: readString(args.format) || "json"
+      });
+      return textToolResult(result);
+    } catch (error) {
+      return toolError(error instanceof Error ? error.message : "memory_export failed");
     }
   }
 

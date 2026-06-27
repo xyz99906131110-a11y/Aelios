@@ -71,6 +71,10 @@ export default {
       return handleMemories(request, env, ctx);
     }
 
+    if (url.pathname === "/api/memories/export") {
+      return handleMemories(request, env, ctx);
+    }
+
     if (url.pathname === "/v1/memory" || url.pathname.startsWith("/v1/memory/")) {
       return handleMemories(request, env, ctx);
     }

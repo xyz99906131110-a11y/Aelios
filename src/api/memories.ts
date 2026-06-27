@@ -5,6 +5,7 @@ import { createMemory, getMemoryById, listMemoriesPage, softDeleteMemory, update
 import { saveIngestMessages } from "../db/messages";
 import { runDailyMemoryDigest } from "../memory/dailyDigest";
 import { deleteMemoryEmbedding, upsertMemoryEmbedding } from "../memory/embedding";
+import { exportMemories } from "../memory/export";
 import { filterAndCompressMemoriesWithMeta } from "../memory/filter";
 import { formatMemoryPatch } from "../memory/inject";
 import { searchMemories, toMemoryApiRecord } from "../memory/search";
@@ -108,6 +109,25 @@ async function handleListMemories(request: Request, env: Env, profile: KeyProfil
       count: page.records.length
     }
   });
+}
+
+async function handleExportMemories(request: Request, env: Env, profile: KeyProfile): Promise<Response> {
+  let scopeError = requireScope(profile, "memory:read");
+  if (scopeError) return scopeError;
+  scopeError = requireScope(profile, "export:read");
+  if (scopeError) return scopeError;
+
+  const url = new URL(request.url);
+  try {
+    const result = await exportMemories(env, {
+      namespace: resolveNamespace(profile, url.searchParams.get("namespace")),
+      type: readString(url.searchParams.get("type")),
+      format: readString(url.searchParams.get("format")) || "json"
+    });
+    return json(result);
+  } catch (error) {
+    return openAiError(error instanceof Error ? error.message : "memory_export failed", 400, "memory_export_error");
+  }
 }
 
 async function handleSearchMemories(request: Request, env: Env, profile: KeyProfile): Promise<Response> {
@@ -345,6 +365,10 @@ export async function handleMemories(request: Request, env: Env, ctx: ExecutionC
 
   if (tail.length === 1 && tail[0] === "ingest" && request.method === "POST") {
     return handleIngestMemories(request, env, ctx, auth.profile);
+  }
+
+  if (tail.length === 1 && tail[0] === "export" && request.method === "GET") {
+    return handleExportMemories(request, env, auth.profile);
   }
 
   if (tail.length === 1) {
