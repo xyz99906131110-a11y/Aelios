@@ -27,16 +27,16 @@ export interface MemoryExportResult {
     source: "vectorize" | "d1";
     vectorize: {
       index_name: string;
-      requested_top_k: number;
-      fetched_count: number;
-      unavailable?: string;
-      fallback?: string;
+      phase1_ids_found: number;
+      phase2_fetched: number;
+      error?: string;
     };
   };
 }
 
+// getByIds batch size — keep small to stay well under any internal limits.
+const GETBYIDS_BATCH = 50;
 const EXPORT_PAGE_SIZE = 1000;
-const VECTORIZE_EXPORT_TOP_K = 1000;
 
 function getIndexName(env: Env): string {
   return env.VECTORIZE_INDEX_NAME?.trim() || "memo-kb";
@@ -115,36 +115,98 @@ function vectorMatchToExportRecord(match: VectorizeMatch): MemoryExportRecord {
   };
 }
 
+/**
+ * Two-phase Vectorize export:
+ *
+ * Phase 1 — discover all vector IDs:
+ *   query(zeroVector, {topK:1000, returnMetadata:'indexed'})
+ *   'indexed' metadata (not 'all') lifts the topK≤50 restriction.
+ *   This returns IDs + indexed fields (namespace, status, type, pinned, kind)
+ *   but NOT content. That's fine — we only need the IDs here.
+ *
+ * Phase 2 — fetch full metadata for each ID:
+ *   getByIds(batch) in chunks of 50.
+ *   getByIds returns full metadata including content, with no topK limit.
+ *
+ * If Vectorize errors at any phase, we report it. We do NOT silently fall
+ * back to D1 (D1 contains deleted/superseded garbage — 520 deleted rows).
+ */
 async function exportFromVectorize(
   env: Env,
   input: { namespace: string; type?: string | null }
-): Promise<{ records: MemoryExportRecord[]; unavailable?: string }> {
-  if (!env.VECTORIZE) return { records: [], unavailable: "missing_vectorize_binding" };
+): Promise<{
+  records: MemoryExportRecord[];
+  phase1Ids: number;
+  phase2Fetched: number;
+  error?: string;
+}> {
+  if (!env.VECTORIZE) {
+    return { records: [], phase1Ids: 0, phase2Fetched: 0, error: "missing_vectorize_binding" };
+  }
 
+  // --- Phase 1: discover all vector IDs via indexed-metadata query ---
   const probe = await createEmbedding(env, "memory export probe");
-  if (!probe) return { records: [], unavailable: "embedding_unavailable_for_vectorize_export" };
+  if (!probe || probe.length === 0) {
+    return { records: [], phase1Ids: 0, phase2Fetched: 0, error: "embedding_unavailable" };
+  }
   const zeroVector = probe.map(() => 0);
 
   const filter: VectorizeVectorMetadataFilter = { namespace: input.namespace };
   if (input.type) filter.type = input.type;
 
+  let phase1Ids: string[] = [];
   try {
     const result = await env.VECTORIZE.query(zeroVector, {
-      topK: VECTORIZE_EXPORT_TOP_K,
+      topK: 1000,
       namespace: input.namespace,
-      returnMetadata: true,
+      returnMetadata: "indexed",
+      returnValues: false,
       filter
     });
-    return { records: result.matches.map(vectorMatchToExportRecord) };
-  } catch (error) {
+    phase1Ids = (result.matches ?? []).map((m) => m.id);
+  } catch (err) {
     return {
       records: [],
-      unavailable: error instanceof Error ? error.message : "vectorize_export_query_failed"
+      phase1Ids: 0,
+      phase2Fetched: 0,
+      error: `phase1_query_failed: ${err instanceof Error ? err.message : String(err)}`
     };
   }
+
+  if (phase1Ids.length === 0) {
+    return { records: [], phase1Ids: 0, phase2Fetched: 0 };
+  }
+
+  // --- Phase 2: fetch full metadata (incl content) via getByIds in batches ---
+  const records: MemoryExportRecord[] = [];
+  let phase2Fetched = 0;
+
+  for (let i = 0; i < phase1Ids.length; i += GETBYIDS_BATCH) {
+    const batch = phase1Ids.slice(i, i + GETBYIDS_BATCH);
+    try {
+      const vectors = await env.VECTORIZE.getByIds(batch);
+      phase2Fetched += vectors.length;
+      for (const v of vectors) {
+        // getByIds returns VectorizeMatch-shaped objects with metadata
+        records.push(vectorMatchToExportRecord(v as unknown as VectorizeMatch));
+      }
+    } catch (err) {
+      // Partial result — return what we have plus the error
+      return {
+        records,
+        phase1Ids: phase1Ids.length,
+        phase2Fetched,
+        error: `phase2_getbyids_failed: ${err instanceof Error ? err.message : String(err)}`
+      };
+    }
+  }
+
+  return { records, phase1Ids: phase1Ids.length, phase2Fetched };
 }
 
-async function listAllMemoryRecords(
+// D1 fallback — only used when Vectorize is completely unavailable.
+// Filters to status='active' to avoid dumping deleted/superseded garbage.
+async function listActiveMemoryRecords(
   env: Env,
   input: { namespace: string; type?: string | null }
 ): Promise<MemoryRecord[]> {
@@ -155,6 +217,7 @@ async function listAllMemoryRecords(
     const page = await listMemoriesPage(env.DB, {
       namespace: input.namespace,
       type: input.type || undefined,
+      status: "active",
       limit: EXPORT_PAGE_SIZE,
       offset
     });
@@ -173,7 +236,7 @@ function toD1ExportRecord(record: MemoryApiRecord): MemoryExportRecord {
 }
 
 async function exportFromD1(env: Env, input: { namespace: string; type?: string | null }): Promise<MemoryExportRecord[]> {
-  const records = await listAllMemoryRecords(env, input);
+  const records = await listActiveMemoryRecords(env, input);
   const lifecycleRows = await fetchMemoryLifecycleRows(env.DB, records.map((record) => record.id));
   const lifecycleByMemoryId = new Map(lifecycleRows.map((row) => [row.memory_id, row]));
 
@@ -192,10 +255,20 @@ export async function exportMemories(env: Env, input: MemoryExportInput): Promis
     namespace: input.namespace,
     type: input.type
   });
-  const usedVectorize = !vectorize.unavailable;
-  const data = usedVectorize
-    ? vectorize.records
-    : await exportFromD1(env, { namespace: input.namespace, type: input.type });
+
+  // Use Vectorize data if we got any (even partial).
+  // Only fall back to D1 if Vectorize is completely unavailable (no binding
+  // or embedding failure) AND returned zero records.
+  let data: MemoryExportRecord[];
+  let source: "vectorize" | "d1";
+
+  if (vectorize.records.length > 0 || !vectorize.error) {
+    data = vectorize.records;
+    source = "vectorize";
+  } else {
+    data = await exportFromD1(env, { namespace: input.namespace, type: input.type });
+    source = "d1";
+  }
 
   return {
     data,
@@ -205,12 +278,12 @@ export async function exportMemories(env: Env, input: MemoryExportInput): Promis
       format: "json",
       count: data.length,
       exported_at: new Date().toISOString(),
-      source: usedVectorize ? "vectorize" : "d1",
+      source,
       vectorize: {
         index_name: getIndexName(env),
-        requested_top_k: VECTORIZE_EXPORT_TOP_K,
-        fetched_count: vectorize.records.length,
-        ...(vectorize.unavailable ? { unavailable: vectorize.unavailable, fallback: "d1" } : {})
+        phase1_ids_found: vectorize.phase1Ids,
+        phase2_fetched: vectorize.phase2Fetched,
+        ...(vectorize.error ? { error: vectorize.error } : {})
       }
     }
   };
