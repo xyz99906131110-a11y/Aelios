@@ -129,12 +129,13 @@ export function getAnthropicCacheMode(env: Env): string | null {
   return parts.join("_");
 }
 
-function applyRollingMessageCache(messages: AnthropicMessage[], env: Env, systemCacheCount: number = 0): void {
+function applyRollingMessageCache(messages: AnthropicMessage[], env: Env, systemBlocks?: AnthropicTextBlock[]): void {
   const cacheControl = buildCacheControl(env);
   if (!cacheControl) return;
   if (env.ANTHROPIC_ROLLING_CACHE_ENABLED === "false") return;
 
   // Anthropic limits cache_control markers to 4 total; subtract system-level markers.
+  const systemCacheCount = systemBlocks?.filter((b) => b.cache_control).length ?? 0;
   const MAX_MESSAGE_MARKERS = Math.max(1, 4 - systemCacheCount);
 
   const userIndices: number[] = [];
@@ -145,12 +146,13 @@ function applyRollingMessageCache(messages: AnthropicMessage[], env: Env, system
   }
   if (userIndices.length === 0) return;
 
-  const n = userIndices.length;
-  const markers = Math.min(n, MAX_MESSAGE_MARKERS);
-  const gap = Math.max(1, Math.floor(n / markers));
+  const last = userIndices[userIndices.length - 1];
+  messages[last].content[messages[last].content.length - 1].cache_control = cacheControl;
 
-  for (let m = 0; m < markers; m++) {
-    const idx = userIndices[m * gap];
+  // Distribute remaining markers evenly across earlier user messages
+  const remaining = Math.min(userIndices.length - 1, MAX_MESSAGE_MARKERS - 1);
+  for (let m = 0; m < remaining; m++) {
+    const idx = userIndices[Math.floor(m * (userIndices.length - 1) / remaining)];
     messages[idx].content[messages[idx].content.length - 1].cache_control = cacheControl;
   }
 }
@@ -460,7 +462,7 @@ export async function buildAnthropicNativeRequest(
   ];
 
   const messages = convertMessages(req.messages);
-  applyRollingMessageCache(messages, input.env);
+  applyRollingMessageCache(messages, input.env, system);
   appendUncachedUserContext(messages, dynamicMemoryPatch);
 
   return {
@@ -474,7 +476,7 @@ export async function buildAnthropicNativeRequest(
     messages,
     ...(tools ? { tools } : {}),
     ...(toolChoice ? { tool_choice: toolChoice } : {}),
-    metadata: { user_id: "operit-user" },
+    ...(input.env.ANTHROPIC_CACHE_USER_ID ? { metadata: { user_id: input.env.ANTHROPIC_CACHE_USER_ID } } : {}),
   };
 }
 
@@ -507,7 +509,7 @@ export function buildAnthropicRequestFromAssembled(
   const system = assembledToAnthropicSystem(systemBlocks);
   const messages = assembledToAnthropicMessages(assembled.messages);
   applyCacheOverrides(system, env);
-  applyRollingMessageCache(messages, env);
+  applyRollingMessageCache(messages, env, system);
   appendUncachedUserContext(messages, dynamicMemoryPatch);
 
   return {
@@ -521,7 +523,7 @@ export function buildAnthropicRequestFromAssembled(
     messages,
     ...(tools ? { tools } : {}),
     ...(toolChoice ? { tool_choice: toolChoice } : {}),
-    metadata: { user_id: "operit-user" },
+    ...(env.ANTHROPIC_CACHE_USER_ID ? { metadata: { user_id: env.ANTHROPIC_CACHE_USER_ID } } : {}),
   };
 }
 
