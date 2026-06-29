@@ -30,7 +30,7 @@ binding = "AI"
 # up in Cloudflare Variables and can be changed without touching code.
 PUBLIC_MODEL_NAME = "companion"
 CHAT_MODEL = "glm-5.2"
-MEMORY_FILTER_MODEL = "workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+MEMORY_FILTER_MODEL = "workers-ai/@cf/meta/llama-3.1-8b-instruct"
 MEMORY_FILTER_MAX_CANDIDATES = "12"
 MEMORY_FILTER_MAX_OUTPUT = "5"
 MEMORY_FILTER_MAX_CONTENT_CHARS = "700"
@@ -41,7 +41,7 @@ MEMORY_FILTER_MAX_TOKENS = "1400"
 # The reranker (bge-reranker-base) + LLM compressor own precision downstream.
 MEMORY_FILTER_MIN_SCORE = "0.1"
 DREAM_MODEL = "glm-5.2"
-EXTRACT_MODEL = "deepseek/deepseek-v4-flash"
+EXTRACT_MODEL = "glm-5.2"
 DEDUP_COSINE = "0.9"
 VISION_MODEL = "google-ai-studio/gemini-3-flash-preview"
 # Vector recall floor (see MEMORY_FILTER_MIN_SCORE note above). Precision is
