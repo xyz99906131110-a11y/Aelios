@@ -17,11 +17,6 @@ export function buildOpenAICompatRequest(req: OpenAIChatRequest, targetModel: st
   };
 }
 
-/**
- * Build an OpenAI-compatible request from an AssembledPrompt.
- * System blocks are merged into one system message; conversation messages
- * (including image_url) are preserved as-is.
- */
 export function buildOpenAIRequestFromAssembled(
   req: OpenAIChatRequest,
   targetModel: string,
@@ -32,7 +27,11 @@ export function buildOpenAIRequestFromAssembled(
 }
 
 export function getOpenAICompatUrl(env: Env): string {
-  return `${normalizeAiGatewayBaseUrl(env)}/compat/chat/completions`;
+  const base = env.AI_GATEWAY_BASE_URL;
+  if (base && base.includes("gateway.ai.cloudflare.com")) {
+    return `${normalizeAiGatewayBaseUrl(env)}/compat/chat/completions`;
+  }
+  return `${base}/chat/completions`;
 }
 
 export function normalizeAiGatewayBaseUrl(env: Env): string {
@@ -62,9 +61,14 @@ export function buildOpenAICompatHeaders(env: Env): Headers {
 }
 
 export async function callOpenAICompat(env: Env, body: OpenAIChatRequest): Promise<Response> {
+  const headers = buildOpenAICompatHeaders(env);
+  const base = env.AI_GATEWAY_BASE_URL;
+  if (base && !base.includes("gateway.ai.cloudflare.com") && env.UPSTREAM_API_KEY) {
+    headers.set("authorization", `Bearer ${env.UPSTREAM_API_KEY}`);
+  }
   return fetch(getOpenAICompatUrl(env), {
     method: "POST",
-    headers: buildOpenAICompatHeaders(env),
+    headers,
     body: JSON.stringify(body)
   });
 }
