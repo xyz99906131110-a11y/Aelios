@@ -566,7 +566,7 @@ async function callTool(
       namespace: resolveNamespace(profile, args.namespace),
       query,
       k: readNumber(args.k, 20),
-      min_score: typeof args.min_score === "number" ? readNumber(args.min_score, 0.3) : undefined,
+      min_score: typeof args.min_score === "number" ? readNumber(args.min_score, 0.15) : undefined,
       types: readStringArray(args.types)
     });
     return textToolResult({ data: result });

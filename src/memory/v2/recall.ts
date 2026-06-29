@@ -42,8 +42,8 @@ function injectDecayFactor(env: Env): number {
 }
 
 function readRecallMinScore(env: Env, override?: number): number {
-  const raw = override ?? Number(env.RECALL_MIN_SCORE ?? 0.3);
-  return Number.isFinite(raw) ? Math.min(Math.max(raw, 0), 1) : 0.3;
+  const raw = override ?? Number(env.RECALL_MIN_SCORE ?? 0.15);
+  return Number.isFinite(raw) ? Math.min(Math.max(raw, 0), 1) : 0.15;
 }
 
 function decayForLastInjected(

@@ -83,7 +83,7 @@ assert.match(digestSource, /content: quote,\s+summary,/s);
 assert.match(digestSource, /if \(v2Enabled && strategy !== "legacy"\) \{\s+const page = await listMemoriesPage\(env\.DB,/s);
 
 assert.match(recallSource, /function readRecallMinScore\(env: Env, override\?: number\): number/);
-assert.match(recallSource, /RECALL_MIN_SCORE \?\? 0\.3/);
+assert.match(recallSource, /RECALL_MIN_SCORE \?\? 0\.15/);
 assert.match(recallSource, /min_score\?: number;/);
 assert.match(recallSource, /floored_ids: string\[\];\s+floored_count: number;\s+min_score: number;/);
 assert.match(recallSource, /const minScore = readRecallMinScore\(env, input\.min_score\);/);
@@ -91,6 +91,6 @@ assert.match(recallSource, /const beforeFloor = \[\.\.\.afterDedup, \.\.\.longta
 assert.match(recallSource, /if \(hit\.score >= minScore\) return true;\s+flooredIds\.push\(hit\.id\);/s);
 assert.match(recallSource, /floored_ids: flooredIds,\s+floored_count: flooredIds\.length,\s+min_score: minScore,/s);
 assert.match(mcpSource, /min_score: \{ type: "number", minimum: 0, maximum: 1 \}/);
-assert.match(mcpSource, /min_score: typeof args\.min_score === "number" \? readNumber\(args\.min_score, 0\.3\) : undefined/);
+assert.match(mcpSource, /min_score: typeof args\.min_score === "number" \? readNumber\(args\.min_score, 0\.15\) : undefined/);
 
 console.log("verify-vector-memory-write: all checks passed");

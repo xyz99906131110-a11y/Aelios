@@ -35,7 +35,7 @@ export interface Env {
   MEMORY_INJECT_DECAY_WINDOW_MIN?: string;
   // 闸三降权系数 (0-1)，默认 0.5
   MEMORY_INJECT_DECAY_FACTOR?: string;
-  // memory_recall 最低分地板，默认 0.3；调用方可用 min_score 临时覆盖。
+  // memory_recall 最低分地板，默认 0.15；调用方可用 min_score 临时覆盖。
   RECALL_MIN_SCORE?: string;
   ENABLE_DAILY_MEMORY_DIGEST?: string;
   DREAM_NAMESPACE?: string;
