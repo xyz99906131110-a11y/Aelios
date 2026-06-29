@@ -1,4 +1,4 @@
-import type { Env, MemoryApiRecord } from "../types";
+import type { Env, MemoryApiRecord, MemoryRecord } from "../types";
 import { newId } from "../utils/ids";
 import { nowIso } from "../utils/time";
 import { createEmbedding } from "./embedding";
@@ -168,6 +168,100 @@ function getMinScore(env: Env): number {
   return Number.isFinite(value) ? Math.min(Math.max(value, 0), 1) : 0.1;
 }
 
+function isLifecycleEnabled(env: Env): boolean {
+  return env.MEMORY_LIFECYCLE_ENABLED !== "false";
+}
+
+function memoryRecordToApiRecord(record: MemoryRecord): MemoryApiRecord {
+  return {
+    id: record.id,
+    namespace: record.namespace,
+    type: record.type,
+    content: record.content,
+    summary: record.summary,
+    importance: record.importance,
+    confidence: record.confidence,
+    status: record.status,
+    pinned: Boolean(record.pinned),
+    tags: parseStringArray(record.tags),
+    source: record.source,
+    source_message_ids: parseStringArray(record.source_message_ids),
+    vector_id: record.vector_id,
+    last_recalled_at: record.last_recalled_at,
+    recall_count: record.recall_count,
+    created_at: record.created_at,
+    updated_at: record.updated_at,
+    expires_at: record.expires_at
+  };
+}
+
+function toMemoryRecord(input: Required<VectorMemoryInput> & { id: string; vectorId: string; createdAt: string; updatedAt: string }): MemoryRecord {
+  return {
+    id: input.id,
+    namespace: input.namespace,
+    type: input.type,
+    content: input.content,
+    summary: input.summary,
+    importance: input.importance,
+    confidence: input.confidence,
+    status: "active",
+    pinned: input.pinned ? 1 : 0,
+    tags: JSON.stringify(input.tags),
+    source: input.source,
+    source_message_ids: JSON.stringify(input.sourceMessageIds),
+    vector_id: input.vectorId,
+    last_recalled_at: null,
+    recall_count: 0,
+    created_at: input.createdAt,
+    updated_at: input.updatedAt,
+    expires_at: input.expiresAt
+  };
+}
+
+async function insertMemoryRecord(env: Env, record: MemoryRecord): Promise<void> {
+  const memoryInsert = env.DB
+    .prepare(
+      `INSERT INTO memories (
+        id, namespace, type, content, summary, importance, confidence, status,
+        pinned, tags, source, source_message_ids, vector_id, created_at, updated_at, expires_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .bind(
+      record.id,
+      record.namespace,
+      record.type,
+      record.content,
+      record.summary,
+      record.importance,
+      record.confidence,
+      record.status,
+      record.pinned,
+      record.tags,
+      record.source,
+      record.source_message_ids,
+      record.vector_id,
+      record.created_at,
+      record.updated_at,
+      record.expires_at
+    );
+
+  if (!isLifecycleEnabled(env)) {
+    await memoryInsert.run();
+    return;
+  }
+
+  const lifecycleInsert = env.DB
+    .prepare(
+      `INSERT OR IGNORE INTO memory_lifecycle (
+        memory_id, namespace, fact_key, supersedes_id, superseded_by_id,
+        review_reason, valid_as_of, last_seen_at, seen_count, last_injected_at
+      ) VALUES (?, ?, NULL, NULL, NULL, NULL, NULL, ?, 0, NULL)`
+    )
+    .bind(record.id, record.namespace, record.created_at);
+
+  await env.DB.batch([memoryInsert, lifecycleInsert]);
+}
+
 async function getVectorsByIdsBatched(
   vectorize: Vectorize | VectorizeIndex,
   ids: string[]
@@ -190,6 +284,63 @@ function candidateVectorIds(id: string): string[] {
       ? [`mem_${trimmed}`, trimmed]
       : [`mem_${trimmed}`, trimmed];
   return [...new Set(candidates)];
+}
+
+function candidateMemoryIds(id: string): string[] {
+  const trimmed = id.trim();
+  if (!trimmed) return [];
+  const candidates = [trimmed];
+  if (trimmed.startsWith("mem_")) candidates.push(trimmed.slice("mem_".length));
+  return [...new Set(candidates.filter(Boolean))];
+}
+
+async function getMemoryRecordById(env: Env, id: string): Promise<MemoryRecord | null> {
+  for (const candidate of candidateMemoryIds(id)) {
+    const record = await env.DB
+      .prepare("SELECT * FROM memories WHERE id = ?")
+      .bind(candidate)
+      .first<MemoryRecord>();
+    if (record) return record;
+  }
+  return null;
+}
+
+async function updateMemoryRecord(env: Env, record: MemoryRecord): Promise<MemoryRecord | null> {
+  await env.DB
+    .prepare(
+      `UPDATE memories SET
+        type = ?, content = ?, summary = ?, importance = ?, confidence = ?, status = ?,
+        pinned = ?, tags = ?, source = ?, source_message_ids = ?, vector_id = ?,
+        updated_at = ?, expires_at = ?
+       WHERE namespace = ? AND id = ?`
+    )
+    .bind(
+      record.type,
+      record.content,
+      record.summary,
+      record.importance,
+      record.confidence,
+      record.status,
+      record.pinned,
+      record.tags,
+      record.source,
+      record.source_message_ids,
+      record.vector_id,
+      record.updated_at,
+      record.expires_at,
+      record.namespace,
+      record.id
+    )
+    .run();
+
+  return getMemoryRecordById(env, record.id);
+}
+
+async function markMemoryRecordDeleted(env: Env, input: { namespace: string; id: string; updatedAt: string }): Promise<void> {
+  await env.DB
+    .prepare("UPDATE memories SET status = 'deleted', updated_at = ? WHERE namespace = ? AND id = ?")
+    .bind(input.updatedAt, input.namespace, input.id)
+    .run();
 }
 
 export async function createVectorMemory(env: Env, input: VectorMemoryInput): Promise<MemoryApiRecord> {
@@ -220,35 +371,23 @@ export async function createVectorMemory(env: Env, input: VectorMemoryInput): Pr
     updatedAt: now
   };
 
-  await requireVectorize(env).upsert([
-    {
-      id: vectorId,
-      namespace: normalized.namespace,
-      values: vector,
-      metadata: toMetadata(normalized)
-    }
-  ]);
+  const record = toMemoryRecord(normalized);
+  await insertMemoryRecord(env, record);
 
-  return {
-    id,
-    namespace: normalized.namespace,
-    type: normalized.type,
-    content,
-    summary: normalized.summary,
-    importance: normalized.importance,
-    confidence: normalized.confidence,
-    status: "active",
-    pinned: normalized.pinned,
-    tags: normalized.tags,
-    source: normalized.source,
-    source_message_ids: normalized.sourceMessageIds,
-    vector_id: vectorId,
-    last_recalled_at: null,
-    recall_count: 0,
-    created_at: now,
-    updated_at: now,
-    expires_at: normalized.expiresAt
-  };
+  try {
+    await requireVectorize(env).upsert([
+      {
+        id: vectorId,
+        namespace: normalized.namespace,
+        values: vector,
+        metadata: toMetadata(normalized)
+      }
+    ]);
+  } catch (error) {
+    console.error("memory vector upsert failed after D1 insert", { id, error });
+  }
+
+  return memoryRecordToApiRecord(record);
 }
 
 export async function getVectorMemory(env: Env, id: string): Promise<MemoryApiRecord | null> {
@@ -260,47 +399,62 @@ export async function getVectorMemory(env: Env, id: string): Promise<MemoryApiRe
     if (record) return record;
   }
 
-  return null;
+  const d1Record = await getMemoryRecordById(env, id);
+  return d1Record ? memoryRecordToApiRecord(d1Record) : null;
 }
 
 export async function deleteVectorMemory(env: Env, id: string): Promise<boolean> {
   const existing = await getVectorMemory(env, id);
   const vectorIds = existing?.vector_id ? [existing.vector_id] : candidateVectorIds(id);
-  if (vectorIds.length === 0) return false;
+  if (!existing && vectorIds.length === 0) return false;
+
+  if (existing) {
+    await markMemoryRecordDeleted(env, { namespace: existing.namespace, id: existing.id, updatedAt: nowIso() });
+  }
 
   if (existing?.vector_id) {
     const vector = await createEmbedding(env, existing.content);
     if (vector) {
       const updatedAt = nowIso();
-      await requireVectorize(env).upsert([
-        {
-          id: existing.vector_id,
-          namespace: existing.namespace,
-          values: vector,
-          metadata: toMetadata({
+      try {
+        await requireVectorize(env).upsert([
+          {
+            id: existing.vector_id,
             namespace: existing.namespace,
-            type: existing.type,
-            content: existing.content,
-            summary: existing.summary ?? null,
-            importance: existing.importance,
-            confidence: existing.confidence,
-            pinned: existing.pinned,
-            tags: existing.tags,
-            source: existing.source ?? null,
-            sourceMessageIds: existing.source_message_ids,
-            expiresAt: existing.expires_at ?? null,
-            id: existing.id,
-            vectorId: existing.vector_id,
-            createdAt: existing.created_at,
-            updatedAt,
-            status: "deleted"
-          })
-        }
-      ]);
+            values: vector,
+            metadata: toMetadata({
+              namespace: existing.namespace,
+              type: existing.type,
+              content: existing.content,
+              summary: existing.summary ?? null,
+              importance: existing.importance,
+              confidence: existing.confidence,
+              pinned: existing.pinned,
+              tags: existing.tags,
+              source: existing.source ?? null,
+              sourceMessageIds: existing.source_message_ids,
+              expiresAt: existing.expires_at ?? null,
+              id: existing.id,
+              vectorId: existing.vector_id,
+              createdAt: existing.created_at,
+              updatedAt,
+              status: "deleted"
+            })
+          }
+        ]);
+      } catch (error) {
+        console.error("memory vector tombstone upsert failed after D1 delete", { id: existing.id, error });
+      }
     }
   }
 
-  await requireVectorize(env).deleteByIds(vectorIds);
+  if (vectorIds.length > 0) {
+    try {
+      await requireVectorize(env).deleteByIds(vectorIds);
+    } catch (error) {
+      console.error("memory vector delete failed after D1 delete", { id, error });
+    }
+  }
   return true;
 }
 
@@ -339,31 +493,44 @@ export async function updateVectorMemory(
     updatedAt
   };
 
-  await requireVectorize(env).upsert([
-    {
-      id: vectorId,
-      namespace: next.namespace,
-      values: vector,
-      metadata: toMetadata(next)
-    }
-  ]);
-
-  return {
-    ...existing,
+  const nextRecord: MemoryRecord = {
+    id: next.id,
+    namespace: next.namespace,
     type: next.type,
     content: next.content,
     summary: next.summary,
     importance: next.importance,
     confidence: next.confidence,
     status: next.status,
-    pinned: next.pinned,
-    tags: next.tags,
+    pinned: next.pinned ? 1 : 0,
+    tags: JSON.stringify(next.tags),
     source: next.source,
-    source_message_ids: next.sourceMessageIds,
-    expires_at: next.expiresAt,
-    updated_at: updatedAt,
-    vector_id: vectorId
+    source_message_ids: JSON.stringify(next.sourceMessageIds),
+    vector_id: next.vectorId,
+    last_recalled_at: existing.last_recalled_at,
+    recall_count: existing.recall_count,
+    created_at: next.createdAt,
+    updated_at: next.updatedAt,
+    expires_at: next.expiresAt
   };
+
+  const updatedRecord = await updateMemoryRecord(env, nextRecord);
+  if (!updatedRecord) return null;
+
+  try {
+    await requireVectorize(env).upsert([
+      {
+        id: vectorId,
+        namespace: next.namespace,
+        values: vector,
+        metadata: toMetadata(next)
+      }
+    ]);
+  } catch (error) {
+    console.error("memory vector upsert failed after D1 update", { id: next.id, error });
+  }
+
+  return memoryRecordToApiRecord(updatedRecord);
 }
 
 export async function searchVectorMemories(
@@ -476,26 +643,25 @@ async function listVectorIdsViaApi(
   };
 }
 
-const MAX_FILTER_SCAN_PAGES = 5;
-
 export async function listVectorMemories(
   env: Env,
   input: VectorMemoryListInput
 ): Promise<VectorMemoryListPage> {
   const hasFilter = Boolean(input.type || input.status);
+  const sortRecords = (records: MemoryApiRecord[]) =>
+    records.sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.importance - a.importance || b.updated_at.localeCompare(a.updated_at));
 
   if (!hasFilter) {
-    // No filter: single page, fast path.
     const listed = await listVectorIdsViaApi(env, input);
     const vectors = listed.ids.length > 0 ? await getVectorsByIdsBatched(requireVectorize(env), listed.ids) : [];
-    const data = vectors
-      .flatMap((vector): MemoryApiRecord[] => {
+    const data = sortRecords(
+      vectors.flatMap((vector): MemoryApiRecord[] => {
         const record = vectorMetadataToMemoryRecord(vector);
         if (!record) return [];
         if (input.namespace && record.namespace !== input.namespace) return [];
         return [record];
       })
-      .sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.importance - a.importance || b.updated_at.localeCompare(a.updated_at));
+    );
 
     return {
       data,
@@ -507,17 +673,16 @@ export async function listVectorMemories(
     };
   }
 
-  // Filtered: scan pages until we have enough matches or run out.
-  const includeInactive = Boolean(input.status && input.status !== "active");
   const filtered: MemoryApiRecord[] = [];
-  let cursor: string | undefined | null = input.cursor;
-  let hasMore = true;
-  let scannedPages = 0;
-  let lastCursor: string | null = null;
-
+  const includeInactive = Boolean(input.status && input.status !== "active");
   const vectorize = requireVectorize(env);
+  let cursor: string | null | undefined = input.cursor;
+  let hasMore = true;
+  let lastCursor: string | null = null;
+  let scannedPages = 0;
+  const maxScanPages = 5;
 
-  while (filtered.length < input.count && hasMore && scannedPages < MAX_FILTER_SCAN_PAGES) {
+  while (filtered.length < input.count && hasMore && scannedPages < maxScanPages) {
     const listed = await listVectorIdsViaApi(env, { ...input, cursor: cursor ?? undefined });
     const vectors = listed.ids.length > 0 ? await getVectorsByIdsBatched(vectorize, listed.ids) : [];
 
@@ -532,22 +697,17 @@ export async function listVectorMemories(
     }
 
     cursor = listed.cursor;
-    hasMore = listed.hasMore;
     lastCursor = listed.cursor;
+    hasMore = listed.hasMore;
     scannedPages += 1;
   }
 
-  const data = filtered.sort(
-    (a, b) => Number(b.pinned) - Number(a.pinned) || b.importance - a.importance || b.updated_at.localeCompare(a.updated_at)
-  );
-
+  const data = sortRecords(filtered);
   return {
     data,
     ids: data.map((record) => record.id),
     cursor: lastCursor,
     hasMore,
     count: data.length
-    // Do not return totalCount when filtering — raw Vectorize count
-    // does not reflect the filtered subset and would be misleading.
   };
 }

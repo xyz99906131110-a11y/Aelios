@@ -42,6 +42,7 @@ const BLOCK_ORDER = [
   "persona_pinned",
   "preset_lite",
   "client_system",
+  "boot_stable",
   "client_volatile_context",
   "dynamic_memory_patch",
   "vision_context",
@@ -94,6 +95,9 @@ function messageToOutput(msg) {
 function isVolatileTimeLine(line) {
   const trimmed = line.trim();
   if (!trimmed) return false;
+  if (/^[【\[](?:当前|现在|系统|本地)?(?:时间|日期|日期时间|时间戳)[】\]]$/.test(trimmed)) return true;
+  if (/^\d{4}[-/]\d{1,2}[-/]\d{1,2}(\s+\d{1,2}:\d{2}(:\d{2})?)?$/.test(trimmed)) return true;
+  if (/^星期\s*[:：]/.test(trimmed)) return true;
   const normalized = trimmed.replace(/^[>*\-\d.)\s]+/, "").trim();
   const lower = normalized.toLowerCase();
 
@@ -114,6 +118,8 @@ function isVolatileTimeLine(line) {
   return hasTimeLabel && (hasDateLikeValue || /\btimezone\b/i.test(normalized) || /时区/.test(normalized));
 }
 
+const VOLATILE_SECTION_HEADER = /^[【\[](?:当前时间|相关记忆|动态上下文|当前位置|系统状态)[】\]]$/;
+
 function splitClientSystemTexts(texts) {
   const stable = [];
   const volatile = [];
@@ -121,9 +127,26 @@ function splitClientSystemTexts(texts) {
   for (const text of texts) {
     const stableLines = [];
     const volatileLines = [];
+    let inVolatileSection = false;
 
     for (const line of text.split(/\r?\n/)) {
-      if (isVolatileTimeLine(line)) volatileLines.push(line.trim());
+      const trimmed = line.trim();
+      if (VOLATILE_SECTION_HEADER.test(trimmed)) {
+        inVolatileSection = true;
+        volatileLines.push(trimmed);
+        continue;
+      }
+
+      if (inVolatileSection) {
+        if (!trimmed) {
+          inVolatileSection = false;
+          continue;
+        }
+        volatileLines.push(trimmed);
+        continue;
+      }
+
+      if (isVolatileTimeLine(line)) volatileLines.push(trimmed);
       else stableLines.push(line);
     }
 
@@ -196,6 +219,28 @@ function assemble(ctx) {
         .filter(Boolean);
       const { stable } = splitClientSystemTexts(texts);
       if (stable.length > 0) text = stable.join("\n\n");
+    } else if (blockId === "boot_stable") {
+      // v2 boot package: digest + yesterday_log + glossary.
+      // Positioned AFTER cache anchor — can change daily without
+      // invalidating the cached system prefix.
+      if (ctx.boot) {
+        const parts = [];
+        if (ctx.boot.digest) {
+          parts.push("<digest>", ctx.boot.digest.content, "</digest>");
+        }
+        if (ctx.boot.yesterday_log) {
+          parts.push(
+            "<yesterday_log>",
+            `【${ctx.boot.yesterday_log.title}】${ctx.boot.yesterday_log.summary}`,
+            "</yesterday_log>"
+          );
+        }
+        if (ctx.boot.glossary && ctx.boot.glossary.length > 0) {
+          const entries = ctx.boot.glossary.map((g) => `${g.term}: ${g.definition}`);
+          parts.push("<glossary>", ...entries, "</glossary>");
+        }
+        if (parts.length > 0) text = parts.join("\n");
+      }
     } else if (blockId === "client_volatile_context") {
       const texts = ctx.systemMessages
         .filter((m) => m.role === "system")
@@ -502,6 +547,32 @@ check("volatile time lines move after client_system without cache_control", () =
   assert.strictEqual(result.system_blocks[volatileIdx].cache_control, undefined);
 });
 
+check("volatile section headers move entire client block after cache anchor", () => {
+  const ctx = makeBaseCtx();
+  ctx.systemMessages = [
+    {
+      role: "system",
+      content: [
+        "稳定角色设定",
+        "【相关记忆】",
+        "这是一段客户端每轮动态注入的记忆",
+        "它不应该污染 stable system cache",
+        "",
+        "稳定补充设定",
+      ].join("\n"),
+    },
+  ];
+  const result = assemble(ctx);
+  const clientIdx = result.meta.block_ids.indexOf("client_system");
+  const volatileIdx = result.meta.block_ids.indexOf("client_volatile_context");
+  assert.ok(result.system_blocks[clientIdx].text.includes("稳定角色设定"));
+  assert.ok(result.system_blocks[clientIdx].text.includes("稳定补充设定"));
+  assert.ok(!result.system_blocks[clientIdx].text.includes("客户端每轮动态注入"));
+  assert.ok(result.system_blocks[volatileIdx].text.includes("【相关记忆】"));
+  assert.ok(result.system_blocks[volatileIdx].text.includes("客户端每轮动态注入"));
+  assert.strictEqual(result.system_blocks[volatileIdx].cache_control, undefined);
+});
+
 check("client_system_hash ignores changing top-level time variables", () => {
   const ctx1 = makeBaseCtx();
   const ctx2 = makeBaseCtx();
@@ -719,7 +790,7 @@ check("system blocks preserve cache_control", () => {
   const assembled = assemble(ctx);
   const anthropicSystem = assembledToAnthropicSystem(assembled.system_blocks);
 
-  // Find the client_system block
+  // Find the client_system block (cache anchor)
   const csIdx = assembled.meta.block_ids.indexOf("client_system");
   assert.ok(csIdx >= 0);
 
@@ -1155,7 +1226,7 @@ check("Anthropic path: full pipeline produces valid system + messages", () => {
   assert.ok(systemBlocks.length >= 3);
   // First block text should contain proxy rules
   assert.ok(systemBlocks[0].text.includes("前端提供的角色"));
-  // Cache anchor present
+  // Cache anchor present on client_system
   const anchor = systemBlocks.find((b) => b.cache_control);
   assert.ok(anchor);
   assert.ok(anchor.text.includes("咲咲的伴侣"));
@@ -1442,21 +1513,28 @@ function getRollingCacheWindowSize(env) {
   return Math.max(Math.floor(value), 1);
 }
 
-function applyRollingMessageCache(messages, env) {
+function applyRollingMessageCache(messages, env, systemBlocks = []) {
   const cacheControl = buildCacheControl(env);
   if (!cacheControl) return;
-  if (env.ANTHROPIC_ROLLING_CACHE_ENABLED === "false") return;
+  if (env.ANTHROPIC_ROLLING_CACHE_ENABLED !== "true") return;
 
+  const systemCacheCount = systemBlocks.filter((block) => block.cache_control).length;
+  const maxMessageMarkers = Math.max(1, 4 - systemCacheCount);
+  const userIndices = [];
   const isFullWindow = messages.length >= getRollingCacheWindowSize(env);
-  const start = isFullWindow ? 0 : messages.length - 1;
-  const end = isFullWindow ? messages.length : -1;
-  const step = isFullWindow ? 1 : -1;
+  const start = isFullWindow ? 0 : Math.max(0, messages.length - 1);
+  for (let i = start; i < messages.length; i += 1) {
+    if (messages[i].role === "user" && messages[i].content.length > 0) userIndices.push(i);
+  }
+  if (userIndices.length === 0) return;
 
-  for (let i = start; i !== end; i += step) {
-    const message = messages[i];
-    if (message.role !== "user" || message.content.length === 0) continue;
-    message.content[message.content.length - 1].cache_control = cacheControl;
-    return;
+  const last = userIndices[userIndices.length - 1];
+  messages[last].content[messages[last].content.length - 1].cache_control = cacheControl;
+
+  const remaining = Math.min(userIndices.length - 1, maxMessageMarkers - 1);
+  for (let marker = 0; marker < remaining; marker += 1) {
+    const idx = userIndices[Math.floor(marker * (userIndices.length - 1) / remaining)];
+    messages[idx].content[messages[idx].content.length - 1].cache_control = cacheControl;
   }
 }
 
@@ -1495,17 +1573,22 @@ function buildAnthropicRequestFromAssembled(req, targetModel, assembled, env) {
   const system = assembledToAnthropicSystem(systemBlocks);
   applyCacheOverrides(system, env);
   const messages = assembledToAnthropicMessages(assembled.messages);
-  applyRollingMessageCache(messages, env);
+  // Rolling cache OFF by default (opt-in via env)
+  if (env.ANTHROPIC_ROLLING_CACHE_ENABLED === "true") {
+    applyRollingMessageCache(messages, env, system);
+  }
+  // dynamic_memory_patch AFTER all breakpoints as uncached user context
   appendUncachedUserContext(messages, dynamicMemoryPatch);
   return {
     model: targetModel.replace(/^anthropic\//i, ""),
     max_tokens: getAnthropicMaxTokens(req, env),
-    cache_control: buildAutomaticCacheControl(env),
+    // No top-level cache_control (was competing with explicit breakpoints)
     temperature: thinking ? undefined : typeof req.temperature === "number" ? req.temperature : undefined,
     stream: Boolean(req.stream),
     thinking,
     system,
     messages,
+    ...(env.ANTHROPIC_CACHE_USER_ID ? { metadata: { user_id: env.ANTHROPIC_CACHE_USER_ID } } : {}),
   };
 }
 
@@ -1566,7 +1649,7 @@ check("OpenAI helper: strips Claude native thinking but keeps reasoning_effort",
   assert.strictEqual(req.reasoning_effort, "high");
 });
 
-check("Anthropic helper: system cache_control stays on client_system", () => {
+check("Anthropic helper: system cache_control on client_system", () => {
   const ctx = makeBaseCtx();
   ctx.systemMessages = [{ role: "system", content: "角色卡" }];
   ctx.ragMemories = [{ type: "note", importance: 0.7, content: "喜欢猫" }];
@@ -1579,10 +1662,11 @@ check("Anthropic helper: system cache_control stays on client_system", () => {
   );
   const withCache = req.system.filter((b) => b.cache_control);
   assert.strictEqual(withCache.length, 1);
+  // Cache is on client_system (long persona text)
   assert.ok(withCache[0].text.includes("角色卡"));
 });
 
-check("Anthropic helper: rolling cache_control lands on latest user message", () => {
+check("Anthropic helper: no top-level cache_control by default", () => {
   const ctx = makeBaseCtx();
   const assembled = assemble(ctx);
   const req = buildAnthropicRequestFromAssembled(
@@ -1591,11 +1675,10 @@ check("Anthropic helper: rolling cache_control lands on latest user message", ()
     assembled,
     {}
   );
-  const lastUser = [...req.messages].reverse().find((m) => m.role === "user");
-  assert.deepStrictEqual(lastUser.content[0].cache_control, { type: "ephemeral" });
+  assert.strictEqual(req.cache_control, undefined);
 });
 
-check("Anthropic helper: full rolling window restarts cache on first user message", () => {
+check("Anthropic helper: full rolling window caches latest user and earlier bridge user (opt-in)", () => {
   const ctx = makeBaseCtx();
   ctx.historyMessages = [
     { role: "assistant", content: "窗口前的助手消息" },
@@ -1608,20 +1691,41 @@ check("Anthropic helper: full rolling window restarts cache on first user messag
     { messages: [] },
     "anthropic/claude-sonnet-4-6",
     assembled,
-    { ANTHROPIC_ROLLING_CACHE_WINDOW_SIZE: "4" }
+    { ANTHROPIC_ROLLING_CACHE_ENABLED: "true", ANTHROPIC_ROLLING_CACHE_WINDOW_SIZE: "4" }
   );
 
   const firstUser = req.messages.find((m) => m.role === "user");
   const firstUserBlock = firstUser.content[firstUser.content.length - 1];
   const lastUser = [...req.messages].reverse().find((m) => m.role === "user");
-  const lastUserBlock = lastUser.content[lastUser.content.length - 1];
+  const lastUserOriginalBlock = lastUser.content[0];
+  const lastUserAppendedBlock = lastUser.content[lastUser.content.length - 1];
 
   assert.strictEqual(firstUser.content[0].text, "窗口第一条用户消息");
   assert.deepStrictEqual(firstUserBlock.cache_control, { type: "ephemeral" });
-  assert.strictEqual(lastUserBlock.cache_control, undefined);
+  assert.deepStrictEqual(lastUserOriginalBlock.cache_control, { type: "ephemeral" });
+  assert.strictEqual(lastUserAppendedBlock.cache_control, undefined);
 });
 
-check("Anthropic helper: dynamic memory is appended after rolling cache point", () => {
+check("Anthropic helper: metadata.user_id comes from env only", () => {
+  const ctx = makeBaseCtx();
+  const assembled = assemble(ctx);
+  const withoutUser = buildAnthropicRequestFromAssembled(
+    { messages: [] },
+    "anthropic/claude-sonnet-4-6",
+    assembled,
+    {}
+  );
+  const withUser = buildAnthropicRequestFromAssembled(
+    { messages: [] },
+    "anthropic/claude-sonnet-4-6",
+    assembled,
+    { ANTHROPIC_CACHE_USER_ID: "aelios-user" }
+  );
+  assert.strictEqual(withoutUser.metadata, undefined);
+  assert.deepStrictEqual(withUser.metadata, { user_id: "aelios-user" });
+});
+
+check("Anthropic helper: dynamic memory is appended as uncached user context", () => {
   const ctx = makeBaseCtx();
   ctx.ragMemories = [
     { type: "note", importance: 0.8, content: "用户喜欢缓存命中率高一点" },
@@ -1635,13 +1739,15 @@ check("Anthropic helper: dynamic memory is appended after rolling cache point", 
     {}
   );
 
+  // Dynamic memory should NOT be in system blocks
   assert.ok(!req.system.some((b) => b.text.includes("用户喜欢缓存命中率高一点")));
 
+  // Dynamic memory should be appended to the last user message
   const lastUser = [...req.messages].reverse().find((m) => m.role === "user");
   assert.ok(lastUser);
   assert.strictEqual(lastUser.content[0].text, "继续优化缓存");
-  assert.deepStrictEqual(lastUser.content[0].cache_control, { type: "ephemeral" });
   assert.ok(lastUser.content[1].text.includes("用户喜欢缓存命中率高一点"));
+  // Dynamic memory block should NOT have cache_control
   assert.strictEqual(lastUser.content[1].cache_control, undefined);
 });
 
@@ -1663,7 +1769,7 @@ check("Anthropic helper: ANTHROPIC_CACHE_ENABLED=false removes cache_control", (
   assert.strictEqual(userBlocksWithCache.length, 0);
 });
 
-check("Anthropic helper: ANTHROPIC_CACHE_TTL=1h sets ttl=1h", () => {
+check("Anthropic helper: ANTHROPIC_CACHE_TTL=1h sets ttl=1h on system anchor", () => {
   const ctx = makeBaseCtx();
   const assembled = assemble(ctx);
   const req = buildAnthropicRequestFromAssembled(
@@ -1675,11 +1781,14 @@ check("Anthropic helper: ANTHROPIC_CACHE_TTL=1h sets ttl=1h", () => {
   const anchor = req.system.find((b) => b.cache_control);
   assert.ok(anchor);
   assert.deepStrictEqual(anchor.cache_control, { type: "ephemeral", ttl: "1h" });
-  const lastUser = [...req.messages].reverse().find((m) => m.role === "user");
-  assert.deepStrictEqual(lastUser.content[0].cache_control, { type: "ephemeral", ttl: "1h" });
+  // No user block cache by default (rolling cache off)
+  const userBlocksWithCache = req.messages
+    .flatMap((m) => m.content)
+    .filter((b) => b.cache_control);
+  assert.strictEqual(userBlocksWithCache.length, 0);
 });
 
-check("Anthropic helper: defaults to stable system plus rolling cache", () => {
+check("Anthropic helper: defaults to system anchor only (no rolling, no auto)", () => {
   const ctx = makeBaseCtx();
   const assembled = assemble(ctx);
   const req = buildAnthropicRequestFromAssembled(
@@ -1688,26 +1797,31 @@ check("Anthropic helper: defaults to stable system plus rolling cache", () => {
     assembled,
     {}
   );
+  // System anchor (persona_pinned) has cache_control
   const anchor = req.system.find((b) => b.cache_control);
   assert.ok(anchor);
   assert.deepStrictEqual(anchor.cache_control, { type: "ephemeral", ttl: "5m" });
+  // No top-level cache_control
   assert.strictEqual(req.cache_control, undefined);
+  // No rolling cache on user messages by default
   const userBlocksWithCache = req.messages
     .flatMap((m) => m.content)
     .filter((b) => b.cache_control);
-  assert.strictEqual(userBlocksWithCache.length, 1);
+  assert.strictEqual(userBlocksWithCache.length, 0);
 });
 
-check("Anthropic helper: automatic cache is opt-in", () => {
+check("Anthropic helper: no top-level automatic cache_control", () => {
   const ctx = makeBaseCtx();
   const assembled = assemble(ctx);
+  // Even with ANTHROPIC_AUTO_CACHE_ENABLED=true, top-level cache_control
+  // is not set — it was competing with explicit breakpoints.
   const req = buildAnthropicRequestFromAssembled(
     { messages: [] },
     "anthropic/claude-sonnet-4-6",
     assembled,
     { ANTHROPIC_AUTO_CACHE_ENABLED: "true" }
   );
-  assert.deepStrictEqual(req.cache_control, { type: "ephemeral" });
+  assert.strictEqual(req.cache_control, undefined);
 });
 
 check("Anthropic helper: structured content stringified (temporary fallback)", () => {
@@ -1823,9 +1937,10 @@ check("Anthropic assembler path: cacheAnchorBlock = 'client_system' when anchor_
 });
 
 check("Anthropic assembler path: cacheAnchorBlock = null when anchor_index < 0", () => {
-  // When no system messages exist, anchor_index is -1
+  // When no system messages AND no pinned persona exist, anchor_index is -1
   const ctx = makeBaseCtx();
   ctx.systemMessages = [];
+  ctx.pinnedPersonaMemories = [];
   const assembled = assemble(ctx);
 
   const clientSystemHash = assembled.meta.client_system_hash;

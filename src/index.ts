@@ -4,14 +4,26 @@ import { handleCache } from "./api/cache";
 import { handleCacheHealth, handleVectorHealth, handleVectorReindex } from "./api/debug";
 import { handleChatCompletions } from "./api/chatCompletions";
 import { handleGuideDogChatCompletions } from "./api/guideDog";
-import { handleIngestMessagesApi, handleMemories, handleSearchMemoriesApi } from "./api/memories";
+import {
+  handleGlossaryApi,
+  handleIngestMessagesApi,
+  handleMemories,
+  handleMemoryBoot,
+  handleMemoryCandidates,
+  handlePrecious,
+  handleSearchMemoriesApi
+} from "./api/memories";
 import { handleMcp } from "./api/mcp";
 import { handleModels } from "./api/models";
 import { runDailyMemoryDigest } from "./memory/dailyDigest";
+import { runMemoryExtractionBatches } from "./memory/extractPipeline";
 import { runMemoryRetention } from "./memory/retention";
 import { handleQueueMessage } from "./queue/consumer";
 import type { Env, QueueMessage } from "./types";
 import { openAiError } from "./utils/json";
+
+const EXTRACT_CRON = "0 */4 * * *";
+const DAILY_MAINTENANCE_CRON = "10 20 * * *";
 
 function getDailyDigestNamespace(env: Env): string {
   return env.DREAM_NAMESPACE?.trim() || "default";
@@ -71,8 +83,28 @@ export default {
       return handleMemories(request, env, ctx);
     }
 
+    if (url.pathname === "/api/memories/export") {
+      return handleMemories(request, env, ctx);
+    }
+
     if (url.pathname === "/v1/memory" || url.pathname.startsWith("/v1/memory/")) {
       return handleMemories(request, env, ctx);
+    }
+
+    if (url.pathname === "/v1/memory_boot") {
+      return handleMemoryBoot(request, env);
+    }
+
+    if (url.pathname === "/v1/precious" || url.pathname.startsWith("/v1/precious/")) {
+      return handlePrecious(request, env);
+    }
+
+    if (url.pathname === "/v1/glossary" || url.pathname.startsWith("/v1/glossary/")) {
+      return handleGlossaryApi(request, env);
+    }
+
+    if (url.pathname === "/v1/candidates" || url.pathname.startsWith("/v1/candidates/")) {
+      return handleMemoryCandidates(request, env);
     }
 
     if (
@@ -117,14 +149,34 @@ export default {
     }
   },
 
-  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+  async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
     const namespace = getDailyDigestNamespace(env);
+    const cron = controller.cron;
+    const shouldRunExtract = !cron || cron === EXTRACT_CRON;
+    const shouldRunDailyMaintenance = !cron || cron === DAILY_MAINTENANCE_CRON;
+    const tasks: Array<Promise<unknown>> = [];
+
+    if (shouldRunExtract) {
+      tasks.push(runMemoryExtractionBatches(env, namespace, { scheduledTime: controller.scheduledTime }));
+    }
+
+    if (shouldRunDailyMaintenance) {
+      tasks.push(
+        Promise.all([
+          runDailyMemoryDigestBatches(env, namespace),
+          runMemoryRetention(env, namespace)
+        ]).then(([digest, retention]) => ({ digest, retention }))
+      );
+    }
+
+    if (tasks.length === 0) {
+      console.log("scheduled memory maintenance skipped unknown cron", { namespace, cron });
+      return;
+    }
+
     ctx.waitUntil(
-      Promise.all([
-        runDailyMemoryDigestBatches(env, namespace),
-        runMemoryRetention(env, namespace)
-      ]).then(([digest, retention]) => {
-        console.log("scheduled daily memory maintenance", { namespace, digest, retention });
+      Promise.all(tasks).then((results) => {
+        console.log("scheduled memory maintenance", { namespace, cron, results });
       })
     );
   }

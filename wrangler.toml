@@ -3,9 +3,24 @@ main = "src/index.ts"
 compatibility_date = "2026-04-01"
 keep_vars = true
 
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[observability.traces]
+enabled = false
+persist = true
+head_sampling_rate = 1
+
 [triggers]
 # Cloudflare cron uses UTC. 20:10 UTC is 04:10 in Singapore/China time.
-crons = ["10 20 * * *"]
+crons = ["0 */4 * * *", "10 20 * * *"]
 
 [ai]
 binding = "AI"
@@ -26,8 +41,9 @@ MEMORY_FILTER_MAX_TOKENS = "1400"
 # The reranker (bge-reranker-base) + LLM compressor own precision downstream.
 MEMORY_FILTER_MIN_SCORE = "0.1"
 DREAM_MODEL = "deepseek/deepseek-v4-pro"
+EXTRACT_MODEL = "deepseek/deepseek-v4-flash"
+DEDUP_COSINE = "0.9"
 VISION_MODEL = "google-ai-studio/gemini-3-flash-preview"
-MEMORY_BACKEND = "vectorize"
 # Vector recall floor (see MEMORY_FILTER_MIN_SCORE note above). Precision is
 # handled by the reranker + compressor, so keep this as a garbage gate only.
 MEMORY_MIN_SCORE = "0.1"
@@ -36,8 +52,6 @@ MEMORY_RERANKER_MODEL = "workers-ai/@cf/baai/bge-reranker-base"
 VECTORIZE_INDEX_NAME = "memo-kb"
 EMBEDDING_MODEL = "workers-ai/@cf/google/embeddinggemma-300m"
 EMBEDDING_DIMENSIONS = "768"
-ENABLE_INCREMENTAL_MEMORY = "false"
-ENABLE_DREAM = "true"
 DREAM_TIME_ZONE = "Asia/Singapore"
 DREAM_MAX_MESSAGES = "40"
 DREAM_MEMORY_CONTEXT_LIMIT = "40"

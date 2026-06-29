@@ -1,5 +1,6 @@
 import { fetchMemoriesByIds, markMemoriesRecalled, searchMemoriesByText } from "../db/memories";
-import type { Env, MemoryApiRecord, MemoryRecord } from "../types";
+import { fetchMemoryLifecycleRows } from "../db/v2";
+import type { Env, MemoryApiRecord, MemoryLifecycleRow, MemoryRecord } from "../types";
 import { createEmbedding } from "./embedding";
 
 type MetadataMap = Record<string, unknown>;
@@ -14,7 +15,12 @@ function parseJsonArray(value: string | null): string[] {
   }
 }
 
-export function toMemoryApiRecord(record: MemoryRecord, score?: number): MemoryApiRecord {
+// v2 字段从 memory_lifecycle 侧车表合并 (可选)。lc 传 undefined 时 v2 字段全 null。
+export function toMemoryApiRecord(
+  record: MemoryRecord,
+  score?: number,
+  lc?: MemoryLifecycleRow | null
+): MemoryApiRecord {
   return {
     id: record.id,
     namespace: record.namespace,
@@ -34,6 +40,15 @@ export function toMemoryApiRecord(record: MemoryRecord, score?: number): MemoryA
     created_at: record.created_at,
     updated_at: record.updated_at,
     expires_at: record.expires_at,
+    // v2 字段 (侧车表)，闸三降权靠 last_injected_at，supersede 链靠 supersedes_*。
+    fact_key: lc?.fact_key ?? null,
+    supersedes_id: lc?.supersedes_id ?? null,
+    superseded_by_id: lc?.superseded_by_id ?? null,
+    review_reason: lc?.review_reason ?? null,
+    valid_as_of: lc?.valid_as_of ?? null,
+    last_seen_at: lc?.last_seen_at ?? null,
+    seen_count: lc?.seen_count ?? 0,
+    last_injected_at: lc?.last_injected_at ?? null,
     ...(score === undefined ? {} : { score })
   };
 }
@@ -51,6 +66,17 @@ function getTopK(env: Env, requested?: number): number {
 function getMinScore(env: Env): number {
   const value = Number(env.MEMORY_MIN_SCORE || 0.1);
   return Number.isFinite(value) ? Math.min(Math.max(value, 0), 1) : 0.1;
+}
+
+function getLegacyFallbackLimit(env: Env, topK: number): number {
+  const value = Number(env.MEMORY_LEGACY_VECTOR_FALLBACK_LIMIT || 3);
+  const limit = Number.isFinite(value) ? Math.max(Math.floor(value), 0) : 3;
+  return Math.min(limit, topK);
+}
+
+function getLegacyFallbackScoreFactor(env: Env): number {
+  const value = Number(env.MEMORY_LEGACY_VECTOR_FALLBACK_SCORE_FACTOR || 0.45);
+  return Number.isFinite(value) ? Math.min(Math.max(value, 0), 1) : 0.45;
 }
 
 function getRefId(match: VectorizeMatch): string | null {
@@ -185,10 +211,13 @@ async function searchWithVectorize(
   const vector = await createEmbedding(env, input.query);
   if (!vector) return null;
 
-  let result = await queryVectorize(env, vector, input, true);
+  const legacyFallbackLimit = getLegacyFallbackLimit(env, input.topK);
+  const vectorTopK = Math.min(Math.max(input.topK * 3, input.topK + legacyFallbackLimit), 100);
+  const vectorInput = { ...input, topK: vectorTopK };
+  let result = await queryVectorize(env, vector, vectorInput, true);
   let usedUnfilteredFallback = false;
   if (result.matches.length === 0) {
-    result = await queryVectorize(env, vector, input, false);
+    result = await queryVectorize(env, vector, vectorInput, false);
     usedUnfilteredFallback = true;
   }
 
@@ -228,11 +257,22 @@ async function searchWithVectorize(
   // Use allRecords (not just active) so inactive D1 records block legacy fallback
   const foundD1Ids = new Set(allRecords.map((record) => record.id));
   const d1Records = activeRecords.map((record) => ({ ...record, score: scoredIds.get(record.id) ?? 0 }));
-  const legacyOnlyRecords = legacyRecords.filter((record) => !foundD1Ids.has(record.id));
+  const legacySlots = Math.max(0, Math.min(input.topK - d1Records.length, legacyFallbackLimit));
+  const legacyOnlyRecords = legacySlots > 0
+    ? legacyRecords
+      .filter((record) => !foundD1Ids.has(record.id))
+      .sort((a, b) => b.score + b.importance * 0.05 - (a.score + a.importance * 0.05))
+      .slice(0, legacySlots)
+      .map((record) => ({
+        ...record,
+        score: record.score * getLegacyFallbackScoreFactor(env),
+        source: record.source === "vectorize" ? "legacy_vectorize" : record.source || "legacy_vectorize"
+      }))
+    : [];
 
   return [...d1Records, ...legacyOnlyRecords].sort(
     (a, b) => b.score + b.importance * 0.05 - (a.score + a.importance * 0.05)
-  );
+  ).slice(0, input.topK);
 }
 
 export async function searchMemories(
@@ -261,5 +301,11 @@ export async function searchMemories(
     ids: records.map((record) => record.id)
   });
 
-  return records.map((record) => toMemoryApiRecord(record, record.score));
+  // v2: 批量查侧车行，合并 last_injected_at (闸三降权) 等 v2 字段。
+  const lifecycleRows = await fetchMemoryLifecycleRows(env.DB, records.map((r) => r.id));
+  const lifecycleByMemoryId = new Map(lifecycleRows.map((lc) => [lc.memory_id, lc]));
+
+  return records.map((record) =>
+    toMemoryApiRecord(record, record.score, lifecycleByMemoryId.get(record.id) ?? null)
+  );
 }

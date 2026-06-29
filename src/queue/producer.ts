@@ -1,6 +1,7 @@
 import type { Env, QueueMessage } from "../types";
 import { newId } from "../utils/ids";
 import { handleQueueMessage } from "./consumer";
+import { isV2Enabled } from "../memory/v2/recall";
 
 /**
  * Send a queue message. Uses real Cloudflare Queue when MEMORY_QUEUE binding
@@ -25,6 +26,7 @@ export async function enqueueMemoryMaintenanceIfNeeded(
   }
 ): Promise<void> {
   if (env.ENABLE_AUTO_MEMORY === "false") return;
+  if (isV2Enabled(env)) return;
   if (env.ENABLE_INCREMENTAL_MEMORY !== "true") return;
   if ((env.MEMORY_MODE || "external") === "none") return;
   if (!input.fromMessageId) return;

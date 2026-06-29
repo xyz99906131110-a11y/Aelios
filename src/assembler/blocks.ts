@@ -17,9 +17,10 @@ import type {
   AssembledPrompt,
   AssemblerContext,
   Block,
+  CacheBreakpoint,
   SystemBlock,
 } from "./types";
-import { BLOCK_ORDER } from "./types";
+import { BLOCK_ORDER, countMessageBlocks, formatBootStable } from "./types";
 
 // ---------------------------------------------------------------------------
 // Local helpers (no external imports — keeps assembler self-contained)
@@ -106,11 +107,40 @@ const personaPinnedBlock: Block = {
   role: "system",
   cache_anchor: false,
   content_fn: (ctx: AssemblerContext): string | null => {
-    const memories = ctx.pinnedPersonaMemories;
-    if (!memories || memories.length === 0) return null;
+    const personaMemories = ctx.pinnedPersonaMemories ?? [];
+    const preciousMemories = ctx.boot?.precious.map((p) => ({
+      id: p.id,
+      namespace: "",
+      type: "precious",
+      content: p.content,
+      summary: null,
+      importance: 1,
+      confidence: 1,
+      status: "active",
+      pinned: true,
+      tags: [],
+      source: "precious",
+      source_message_ids: [],
+      vector_id: null,
+      last_recalled_at: null,
+      recall_count: 0,
+      created_at: p.created_at,
+      updated_at: p.created_at,
+      expires_at: null,
+      fact_key: null,
+      supersedes_id: null,
+      superseded_by_id: null,
+      review_reason: null,
+      valid_as_of: null,
+      last_seen_at: null,
+      seen_count: 0,
+      last_injected_at: null,
+      score: undefined,
+    })) ?? [];
+    const all = [...personaMemories, ...preciousMemories];
+    if (all.length === 0) return null;
 
-    // Deterministic sort: type asc → importance desc → id asc
-    const sorted = [...memories].sort((a, b) => {
+    const sorted = [...all].sort((a, b) => {
       const typeCmp = a.type.localeCompare(b.type);
       if (typeCmp !== 0) return typeCmp;
       if (b.importance !== a.importance) return b.importance - a.importance;
@@ -145,6 +175,24 @@ const presetLiteBlock: Block = {
 };
 
 // ---------------------------------------------------------------------------
+// Block 3.5: boot_stable (stable)
+// v2 boot package: digest + yesterday_log + glossary.
+// Sits before cache anchor — stable content that rarely changes.
+// ---------------------------------------------------------------------------
+
+const bootStableBlock: Block = {
+  id: "boot_stable",
+  kind: "stable",
+  role: "system",
+  cache_anchor: false,
+  content_fn: (ctx: AssemblerContext): string | null => {
+    if (!ctx.boot) return null;
+    const text = formatBootStable(ctx.boot);
+    return text || null;
+  },
+};
+
+// ---------------------------------------------------------------------------
 // Block 4: client_system (stable, cache_anchor = true)
 // Frontend system messages concatenated.
 // ---------------------------------------------------------------------------
@@ -159,7 +207,6 @@ function extractSystemTexts(messages: OpenAIChatMessage[]): string[] {
 function isVolatileTimeLine(line: string): boolean {
   const trimmed = line.trim();
   if (!trimmed) return false;
-  // Multi-line time formats (e.g. Operit injects time as separate lines).
   if (/^[【\[](?:当前|现在|系统|本地)?(?:时间|日期|日期时间|时间戳)[】\]]$/.test(trimmed)) return true;
   if (/^\d{4}[-/]\d{1,2}[-/]\d{1,2}(\s+\d{1,2}:\d{2}(:\d{2})?)?$/.test(trimmed)) return true;
   if (/^星期\s*[:：]/.test(trimmed)) return true;
@@ -183,8 +230,6 @@ function isVolatileTimeLine(line: string): boolean {
   return hasTimeLabel && (hasDateLikeValue || /\btimezone\b/i.test(normalized) || /时区/.test(normalized));
 }
 
-// Operit 等客户端注入的"动态段"标题白名单
-// 看到这些标题，整段（直到空行）都视为 volatile，避免破坏 Claude prompt cache
 const VOLATILE_SECTION_HEADER = /^[【\[](?:当前时间|相关记忆|动态上下文|当前位置|系统状态)[】\]]$/;
 
 function splitClientSystemTexts(texts: string[]): { stable: string[]; volatile: string[] } {
@@ -198,15 +243,12 @@ function splitClientSystemTexts(texts: string[]): { stable: string[]; volatile: 
 
     for (const line of text.split(/\r?\n/)) {
       const trimmed = line.trim();
-
-      // 进入新的 volatile 段
       if (VOLATILE_SECTION_HEADER.test(trimmed)) {
         inVolatileSection = true;
         volatileLines.push(trimmed);
         continue;
       }
 
-      // 已经在 volatile 段内
       if (inVolatileSection) {
         if (!trimmed) {
           inVolatileSection = false;
@@ -216,12 +258,8 @@ function splitClientSystemTexts(texts: string[]): { stable: string[]; volatile: 
         continue;
       }
 
-      // 段外按原逻辑逐行判断
-      if (isVolatileTimeLine(line)) {
-        volatileLines.push(line.trim());
-      } else {
-        stableLines.push(line);
-      }
+      if (isVolatileTimeLine(line)) volatileLines.push(trimmed);
+      else stableLines.push(line);
     }
 
     const stableText = stableLines.join("\n").trim();
@@ -353,6 +391,7 @@ const BLOCK_MAP = new Map<string, Block>([
   [proxyStaticRulesBlock.id, proxyStaticRulesBlock],
   [personaPinnedBlock.id, personaPinnedBlock],
   [presetLiteBlock.id, presetLiteBlock],
+  [bootStableBlock.id, bootStableBlock],
   [clientSystemBlock.id, clientSystemBlock],
   [clientVolatileContextBlock.id, clientVolatileContextBlock],
   [dynamicMemoryPatchBlock.id, dynamicMemoryPatchBlock],
@@ -448,6 +487,89 @@ export function assemble(ctx: AssemblerContext): AssembledPrompt {
     }
   }
 
+  // --- Cache breakpoints (up to 4 for Anthropic) ---
+  //
+  // Anthropic prompt caching works on the full prefix: tools → system → messages.
+  // Each breakpoint marks a position; everything before it is cached.
+  // Each looks back up to 20 content blocks for a previous cache entry.
+  //
+  // Breakpoint 1 (tools): applied in adapter if tool definitions are stable.
+  // Breakpoint 2 (system): persona_pinned — the most stable content.
+  // Breakpoint 3 (bridge): mid-history for long conversations (>16 blocks),
+  //   so the tail anchor's 20-block lookback doesn't lose older cached prefix.
+  // Breakpoint 4 (tail): last stable block before dynamic content.
+  //   Mode A (default): last block of the message before current_user.
+  //   Mode B: first text block of current_user (opt-in).
+  //
+  // Dynamic content (memories, time reminders) is appended AFTER all
+  // breakpoints and never gets cache_control.
+  const LOOKBACK = 16; // Conservative margin (Anthropic allows 20)
+  const breakpoints: CacheBreakpoint[] = [];
+
+  // Breakpoint 2: system anchor on persona_pinned
+  if (anchorIndex >= 0) {
+    breakpoints.push({
+      target: "system",
+      system_block_index: anchorIndex,
+      reason: "system",
+    });
+  }
+
+  // Message-level breakpoints: bridge + tail
+  // Count content blocks in each message for 20-block lookback spacing
+  const msgBlockCounts = messages.map((m) => countMessageBlocks(m.content));
+
+  // tailIdx: message to place the tail breakpoint on.
+  // Default (mode A): second-to-last message (last history msg before current user).
+  // If only 1 message and mode A: no tail (system anchor covers the prefix).
+  let tailIdx = -1;
+  let tailBlockIdx = -1;
+  if (messages.length >= 2) {
+    tailIdx = messages.length - 2;
+    tailBlockIdx = Math.max(0, msgBlockCounts[tailIdx] - 1);
+  }
+
+  if (tailIdx >= 0) {
+    breakpoints.push({
+      target: "message",
+      message_index: tailIdx,
+      block_index: tailBlockIdx,
+      reason: "tail",
+    });
+
+    // bridge: if total message blocks before the tail message is > LOOKBACK,
+    // place a bridge anchor ~LOOKBACK blocks before the tail to keep the
+    // cache chain connected across long conversations.
+    let blocksBeforeTail = 0;
+    for (let i = 0; i < tailIdx; i++) blocksBeforeTail += msgBlockCounts[i];
+
+    if (blocksBeforeTail > LOOKBACK) {
+      // Walk backward from tailIdx to find the message containing
+      // the block at position (blocksBeforeTail - LOOKBACK)
+      let target = blocksBeforeTail - LOOKBACK;
+      let accumulated = 0;
+      let bridgeMsgIdx = 0;
+      let bridgeBlockIdx = 0;
+      for (let i = 0; i < tailIdx; i++) {
+        if (accumulated + msgBlockCounts[i] > target) {
+          bridgeMsgIdx = i;
+          bridgeBlockIdx = target - accumulated;
+          break;
+        }
+        accumulated += msgBlockCounts[i];
+      }
+      // Don't add bridge if it would be the same as tail
+      if (bridgeMsgIdx !== tailIdx || bridgeBlockIdx !== tailBlockIdx) {
+        breakpoints.push({
+          target: "message",
+          message_index: bridgeMsgIdx,
+          block_index: bridgeBlockIdx,
+          reason: "bridge",
+        });
+      }
+    }
+  }
+
   return {
     system_blocks: systemBlocks,
     messages,
@@ -455,6 +577,7 @@ export function assemble(ctx: AssemblerContext): AssembledPrompt {
       anchor_index: anchorIndex,
       block_ids: enabledBlockIds,
       client_system_hash: clientSystemHash,
+      cache_breakpoints: breakpoints,
     },
   };
 }

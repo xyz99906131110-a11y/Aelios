@@ -1,19 +1,37 @@
 import { authenticate } from "../auth/apiKey";
 import { requireScope } from "../auth/scopes";
 import { getOrCreateConversation } from "../db/conversations";
-import { saveIngestMessages } from "../db/messages";
+import { createMemory, getMemoryById, listMemoriesPage, softDeleteMemory, updateMemory } from "../db/memories";
+import { listMessagesByNamespaceInRange, saveIngestMessages } from "../db/messages";
 import { runDailyMemoryDigest } from "../memory/dailyDigest";
+import { deleteMemoryEmbedding, upsertMemoryEmbedding } from "../memory/embedding";
+import { exportMemories } from "../memory/export";
 import { filterAndCompressMemoriesWithMeta } from "../memory/filter";
 import { formatMemoryPatch } from "../memory/inject";
-import { searchMemories } from "../memory/search";
+import { searchMemories, toMemoryApiRecord } from "../memory/search";
 import {
-  createVectorMemory,
-  deleteVectorMemory,
-  getVectorMemory,
-  listVectorMemories,
-  searchVectorMemories,
-  updateVectorMemory
-} from "../memory/vectorStore";
+  countActiveMemoriesByType,
+  countMemoryCandidates,
+  createPrecious,
+  deleteGlossary,
+  deletePrecious,
+  fetchMemoryLifecycleRows,
+  getDigest,
+  getDailyLog,
+  getMemoryCandidateById,
+  listGlossary,
+  listLongtail,
+  listMemoryCandidates,
+  listPrecious,
+  type MemoryCandidateRow,
+  supersedeMemory,
+  updateGlossary,
+  updateMemoryCandidateStatus,
+  upsertDigest,
+  upsertGlossary,
+  upsertMemoryByFactKey
+} from "../db/v2";
+import { isV2Enabled } from "../memory/v2/recall";
 import { enqueueMemoryMaintenanceIfNeeded } from "../queue/producer";
 import type { Env, KeyProfile } from "../types";
 import { json, openAiError } from "../utils/json";
@@ -22,12 +40,29 @@ import {
   readJsonObject,
   readMessages,
   readNumber,
+  readNonNegativeInt,
   readOptionalString,
   readPositiveInt,
   readString,
   readStringArray,
   resolveNamespace
 } from "../utils/request";
+
+async function syncMemoryEmbeddingBestEffort(env: Env, memory: Awaited<ReturnType<typeof createMemory>>): Promise<void> {
+  try {
+    await upsertMemoryEmbedding(env, memory);
+  } catch (error) {
+    console.error("memory api vector upsert failed", { id: memory.id, error });
+  }
+}
+
+async function deleteMemoryEmbeddingBestEffort(env: Env, memory: Awaited<ReturnType<typeof createMemory>>): Promise<void> {
+  try {
+    await deleteMemoryEmbedding(env, memory);
+  } catch (error) {
+    console.error("memory api vector delete failed", { id: memory.id, error });
+  }
+}
 
 async function handleCreateMemory(
   request: Request,
@@ -47,9 +82,37 @@ async function handleCreateMemory(
     return openAiError("content is required", 400);
   }
 
+  if (isV2Enabled(env)) {
+    const namespace = resolveNamespace(profile, body.namespace);
+    const factKey = readString(body.fact_key);
+    if (!factKey) return openAiError("fact_key is required in v2; use memory_pin for precious append-only notes", 400);
+    try {
+      const result = await upsertMemoryByFactKey(env, {
+        namespace,
+        factKey,
+        type,
+        content,
+        importance: readNumber(body.importance, 0.6),
+        confidence: readNumber(body.confidence, 0.8),
+        tags: readStringArray(body.tags),
+        source: readOptionalString(body.source) || profile.source,
+        sourceMessageIds: readStringArray(body.source_message_ids),
+        validAsOf: readOptionalString(body.valid_as_of)
+      });
+      const record = await getMemoryById(env.DB, { namespace, id: result.id });
+      const lifecycleRows = record ? await fetchMemoryLifecycleRows(env.DB, [record.id]) : [];
+      return json({
+        data: record ? toMemoryApiRecord(record, undefined, lifecycleRows[0] ?? null) : result
+      }, { status: result.created ? 201 : 200 });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "memory_upsert failed";
+      return openAiError(message, 503, "memory_error");
+    }
+  }
+
   let memory;
   try {
-    memory = await createVectorMemory(env, {
+    const created = await createMemory(env.DB, {
       namespace: resolveNamespace(profile, body.namespace),
       type,
       content,
@@ -62,6 +125,8 @@ async function handleCreateMemory(
       sourceMessageIds: readStringArray(body.source_message_ids),
       expiresAt: readOptionalString(body.expires_at)
     });
+    await syncMemoryEmbeddingBestEffort(env, created);
+    memory = toMemoryApiRecord(created);
   } catch (error) {
     const message = error instanceof Error ? error.message : "memory_create failed";
     return openAiError(message, 503, "memory_error");
@@ -77,24 +142,43 @@ async function handleListMemories(request: Request, env: Env, profile: KeyProfil
   const url = new URL(request.url);
   const namespace = resolveNamespace(profile, url.searchParams.get("namespace"));
   const limit = readPositiveInt(url.searchParams.get("limit"), 100, 1000);
-  const page = await listVectorMemories(env, {
+  const offset = readNonNegativeInt(url.searchParams.get("offset") ?? url.searchParams.get("cursor"), 0, 1000000);
+  const page = await listMemoriesPage(env.DB, {
     namespace,
-    count: limit,
-    cursor: readString(url.searchParams.get("cursor")),
-    type: readString(url.searchParams.get("type")) ?? undefined,
-    status: readString(url.searchParams.get("status")) ?? undefined
+    status: readString(url.searchParams.get("status")) || "active",
+    type: readString(url.searchParams.get("type")),
+    limit,
+    offset
   });
 
   return json({
-    data: page.data,
+    data: page.records.map((record) => toMemoryApiRecord(record)),
     paging: {
       limit,
-      cursor: page.cursor,
+      cursor: page.nextOffset === null ? null : String(page.nextOffset),
       has_more: page.hasMore,
-      count: page.count,
-      total_count: page.totalCount
+      count: page.records.length
     }
   });
+}
+
+async function handleExportMemories(request: Request, env: Env, profile: KeyProfile): Promise<Response> {
+  let scopeError = requireScope(profile, "memory:read");
+  if (scopeError) return scopeError;
+  scopeError = requireScope(profile, "export:read");
+  if (scopeError) return scopeError;
+
+  const url = new URL(request.url);
+  try {
+    const result = await exportMemories(env, {
+      namespace: resolveNamespace(profile, url.searchParams.get("namespace")),
+      type: readString(url.searchParams.get("type")),
+      format: readString(url.searchParams.get("format")) || "json"
+    });
+    return json(result);
+  } catch (error) {
+    return openAiError(error instanceof Error ? error.message : "memory_export failed", 400, "memory_export_error");
+  }
 }
 
 async function handleSearchMemories(request: Request, env: Env, profile: KeyProfile): Promise<Response> {
@@ -110,10 +194,7 @@ async function handleSearchMemories(request: Request, env: Env, profile: KeyProf
   const namespace = resolveNamespace(profile, body.namespace);
   const topK = readPositiveInt(body.top_k, Number(env.MEMORY_TOP_K || 50), 50);
   const types = readStringArray(body.types);
-  const raw =
-    env.MEMORY_BACKEND === "d1"
-      ? await searchMemories(env, { namespace, query, topK, types })
-      : await searchVectorMemories(env, { namespace, query, topK, types });
+  const raw = await searchMemories(env, { namespace, query, topK, types });
   const shouldFilter = readBoolean(body.filter, true);
   const filterResult = shouldFilter
     ? await filterAndCompressMemoriesWithMeta(env, { query, memories: raw })
@@ -124,7 +205,7 @@ async function handleSearchMemories(request: Request, env: Env, profile: KeyProf
     data,
     meta: {
       namespace,
-      backend: env.MEMORY_BACKEND === "d1" ? "d1" : "vectorize",
+      backend: "d1",
       top_k: topK,
       raw_count: raw.length,
       count: data.length,
@@ -226,6 +307,395 @@ async function handleRunDigest(
   });
 }
 
+function parseJsonArray(value: string | null): string[] {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function toCandidateApiRecord(row: MemoryCandidateRow) {
+  return {
+    id: row.id,
+    namespace: row.namespace,
+    type: row.type,
+    content: row.content,
+    fact_key: row.fact_key,
+    confidence: row.confidence,
+    importance: row.importance,
+    tags: parseJsonArray(row.tags),
+    source_message_ids: parseJsonArray(row.source_message_ids),
+    source: row.source,
+    status: row.status,
+    target_memory_id: row.target_memory_id,
+    decision_note: row.decision_note,
+    created_at: row.created_at,
+    updated_at: row.updated_at
+  };
+}
+
+function yesterdayDateLabel(now = new Date()): string {
+  const date = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+  return date.toISOString().slice(0, 10);
+}
+
+async function countMessagesInRange(
+  db: D1Database,
+  input: { namespace: string; startCreatedAt: string; endCreatedAt: string }
+): Promise<number> {
+  const row = await db
+    .prepare(
+      `SELECT COUNT(*) AS count
+       FROM messages
+       WHERE namespace = ?
+         AND role IN ('user', 'assistant')
+         AND created_at >= ?
+         AND created_at < ?`
+    )
+    .bind(input.namespace, input.startCreatedAt, input.endCreatedAt)
+    .first<{ count: number }>();
+  return row?.count ?? 0;
+}
+
+export async function handleMemoryBoot(request: Request, env: Env): Promise<Response> {
+  const auth = await authenticate(request, env);
+  if (!auth.ok) return openAiError("Unauthorized", 401, "authentication_error");
+
+  const url = new URL(request.url);
+  const namespace = resolveNamespace(auth.profile, url.searchParams.get("namespace"));
+
+  if (request.method === "PATCH") {
+    const scopeError = requireScope(auth.profile, "memory:write");
+    if (scopeError) return scopeError;
+    const body = await readJsonObject(request);
+    if (!body) return openAiError("Request body must be a JSON object", 400);
+    const content = readString(body.content);
+    if (!content) return openAiError("content is required", 400);
+    const digest = await upsertDigest(env.DB, { namespace, content: content.slice(0, 1200) });
+    return json({ data: digest });
+  }
+
+  if (request.method !== "GET") return openAiError("Not found", 404);
+  const scopeError = requireScope(auth.profile, "memory:read");
+  if (scopeError) return scopeError;
+
+  const start = readString(url.searchParams.get("start")) || new Date().toISOString().slice(0, 10) + "T00:00:00.000Z";
+  const end = readString(url.searchParams.get("end")) || new Date().toISOString();
+  const dailyDate = readString(url.searchParams.get("daily_date")) || yesterdayDateLabel();
+  const [digest, dailyLog, precious, glossary, longtail, todayMessages, todayRawCount, pendingCount, typeCounts] = await Promise.all([
+    getDigest(env.DB, namespace),
+    getDailyLog(env.DB, { namespace, date: dailyDate }),
+    listPrecious(env.DB, { namespace, limit: 100 }),
+    listGlossary(env.DB, { namespace }),
+    listLongtail(env.DB, { namespace, limit: 80 }),
+    listMessagesByNamespaceInRange(env.DB, {
+      namespace,
+      startCreatedAt: start,
+      endCreatedAt: end,
+      limit: 160
+    }),
+    countMessagesInRange(env.DB, { namespace, startCreatedAt: start, endCreatedAt: end }),
+    countMemoryCandidates(env.DB, { namespace, status: "pending" }),
+    countActiveMemoriesByType(env.DB, namespace)
+  ]);
+
+  return json({
+    data: {
+      namespace,
+      digest,
+      daily_log: dailyLog,
+      precious,
+      glossary,
+      longtail,
+      today_messages: todayMessages,
+      stats: {
+        today_raw_count: todayRawCount,
+        pending_candidates: pendingCount,
+        memory_type_counts: typeCounts
+      }
+    }
+  });
+}
+
+export async function handlePrecious(request: Request, env: Env): Promise<Response> {
+  const auth = await authenticate(request, env);
+  if (!auth.ok) return openAiError("Unauthorized", 401, "authentication_error");
+
+  const url = new URL(request.url);
+  const namespace = resolveNamespace(auth.profile, url.searchParams.get("namespace"));
+  const parts = url.pathname.split("/").filter(Boolean);
+  const id = parts[1];
+
+  if (request.method === "GET" && !id) {
+    const scopeError = requireScope(auth.profile, "memory:read");
+    if (scopeError) return scopeError;
+    const rows = await listPrecious(env.DB, { namespace, limit: readPositiveInt(url.searchParams.get("limit"), 100, 200) });
+    return json({ data: rows });
+  }
+
+  const scopeError = requireScope(auth.profile, "memory:write");
+  if (scopeError) return scopeError;
+
+  if (request.method === "POST" && !id) {
+    const body = await readJsonObject(request);
+    if (!body) return openAiError("Request body must be a JSON object", 400);
+    const content = readString(body.content);
+    if (!content) return openAiError("content is required", 400);
+    const row = await createPrecious(env.DB, {
+      namespace: resolveNamespace(auth.profile, body.namespace),
+      content,
+      contextMessageIds: readStringArray(body.context_message_ids),
+      source: readString(body.source) || "human"
+    });
+    return json({ data: row }, { status: 201 });
+  }
+
+  if (request.method === "DELETE" && id) {
+    const deleted = await deletePrecious(env.DB, { namespace, id });
+    if (!deleted) return openAiError("Precious memory not found", 404);
+    return json({ data: { id, deleted: true } });
+  }
+
+  return openAiError("Not found", 404);
+}
+
+export async function handleGlossaryApi(request: Request, env: Env): Promise<Response> {
+  const auth = await authenticate(request, env);
+  if (!auth.ok) return openAiError("Unauthorized", 401, "authentication_error");
+
+  const url = new URL(request.url);
+  const namespace = resolveNamespace(auth.profile, url.searchParams.get("namespace"));
+  const parts = url.pathname.split("/").filter(Boolean);
+  const id = parts[1];
+
+  if (request.method === "GET" && !id) {
+    const scopeError = requireScope(auth.profile, "memory:read");
+    if (scopeError) return scopeError;
+    const rows = await listGlossary(env.DB, {
+      namespace,
+      status: readString(url.searchParams.get("status")) || "active"
+    });
+    return json({ data: rows });
+  }
+
+  const scopeError = requireScope(auth.profile, "memory:write");
+  if (scopeError) return scopeError;
+
+  if (request.method === "POST" && !id) {
+    const body = await readJsonObject(request);
+    if (!body) return openAiError("Request body must be a JSON object", 400);
+    const term = readString(body.term);
+    const definition = readString(body.definition);
+    if (!term || !definition) return openAiError("term and definition are required", 400);
+    const row = await upsertGlossary(env.DB, {
+      namespace: resolveNamespace(auth.profile, body.namespace),
+      term,
+      aliases: readStringArray(body.aliases),
+      definition,
+      examples: readStringArray(body.examples)
+    });
+    return json({ data: row });
+  }
+
+  if (request.method === "PATCH" && id) {
+    const body = await readJsonObject(request);
+    if (!body) return openAiError("Request body must be a JSON object", 400);
+    const row = await updateGlossary(env.DB, {
+      namespace: resolveNamespace(auth.profile, body.namespace),
+      id,
+      term: readString(body.term),
+      aliases: Array.isArray(body.aliases) ? readStringArray(body.aliases) : undefined,
+      definition: readString(body.definition),
+      examples: Array.isArray(body.examples) ? readStringArray(body.examples) : undefined,
+      status: readString(body.status)
+    });
+    if (!row) return openAiError("Glossary term not found", 404);
+    return json({ data: row });
+  }
+
+  if (request.method === "DELETE" && id) {
+    const deleted = await deleteGlossary(env.DB, { namespace, id });
+    if (!deleted) return openAiError("Glossary term not found", 404);
+    return json({ data: { id, deleted: true } });
+  }
+
+  return openAiError("Not found", 404);
+}
+
+async function createApprovedMemoryFromCandidate(
+  env: Env,
+  input: {
+    namespace: string;
+    type: string;
+    content: string;
+    factKey?: string | null;
+    confidence: number;
+    importance: number;
+    tags: string[];
+    sourceMessageIds: string[];
+    source: string;
+  }
+): Promise<string> {
+  if (input.factKey) {
+    const result = await upsertMemoryByFactKey(env, {
+      namespace: input.namespace,
+      factKey: input.factKey,
+      type: input.type,
+      content: input.content,
+      confidence: input.confidence,
+      importance: input.importance,
+      tags: input.tags,
+      source: input.source,
+      sourceMessageIds: input.sourceMessageIds
+    });
+    return result.id;
+  }
+
+  const created = await createMemory(env.DB, {
+    namespace: input.namespace,
+    type: input.type,
+    content: input.content,
+    confidence: input.confidence,
+    importance: input.importance,
+    tags: input.tags,
+    source: input.source,
+    sourceMessageIds: input.sourceMessageIds
+  });
+  await syncMemoryEmbeddingBestEffort(env, created);
+  return created.id;
+}
+
+export async function handleMemoryCandidates(request: Request, env: Env): Promise<Response> {
+  const auth = await authenticate(request, env);
+  if (!auth.ok) return openAiError("Unauthorized", 401, "authentication_error");
+
+  const url = new URL(request.url);
+  const namespace = resolveNamespace(auth.profile, url.searchParams.get("namespace"));
+  const parts = url.pathname.split("/").filter(Boolean);
+  const id = parts[1];
+  const action = parts[2];
+
+  if (request.method === "GET" && !id) {
+    const scopeError = requireScope(auth.profile, "memory:read");
+    if (scopeError) return scopeError;
+    const rows = await listMemoryCandidates(env.DB, {
+      namespace,
+      status: readString(url.searchParams.get("status")) || "pending",
+      limit: readPositiveInt(url.searchParams.get("limit"), 100, 200)
+    });
+    return json({ data: rows.map(toCandidateApiRecord) });
+  }
+
+  const scopeError = requireScope(auth.profile, "memory:write");
+  if (scopeError) return scopeError;
+  if (!id || request.method !== "POST") return openAiError("Not found", 404);
+
+  const candidate = await getMemoryCandidateById(env.DB, { namespace, id });
+  if (!candidate) return openAiError("Candidate not found", 404);
+  const body = (await readJsonObject(request)) ?? {};
+  const content = readString(body.content) || candidate.content;
+  const type = readString(body.type) || candidate.type;
+  const factKey = body.fact_key === null ? null : readString(body.fact_key) ?? candidate.fact_key;
+  const confidence = readNumber(body.confidence, candidate.confidence);
+  const importance = readNumber(body.importance, candidate.importance);
+  const tags = Array.isArray(body.tags) ? readStringArray(body.tags) : parseJsonArray(candidate.tags);
+  const sourceMessageIds = Array.isArray(body.source_message_ids)
+    ? readStringArray(body.source_message_ids)
+    : parseJsonArray(candidate.source_message_ids);
+
+  if (action === "approve") {
+    const memoryId = await createApprovedMemoryFromCandidate(env, {
+      namespace,
+      type,
+      content,
+      factKey,
+      confidence,
+      importance,
+      tags,
+      sourceMessageIds,
+      source: "review"
+    });
+    const updated = await updateMemoryCandidateStatus(env.DB, {
+      namespace,
+      id,
+      status: "approved",
+      targetMemoryId: memoryId,
+      decisionNote: readString(body.decision_note) || "approved"
+    });
+    return json({ data: { candidate: updated ? toCandidateApiRecord(updated) : null, memory_id: memoryId } });
+  }
+
+  if (action === "discard") {
+    const updated = await updateMemoryCandidateStatus(env.DB, {
+      namespace,
+      id,
+      status: "discarded",
+      decisionNote: readString(body.decision_note) || "discarded"
+    });
+    return json({ data: updated ? toCandidateApiRecord(updated) : null });
+  }
+
+  if (action === "merge") {
+    const targetId = readString(body.target_id);
+    if (!targetId) return openAiError("target_id is required", 400);
+    const target = await getMemoryById(env.DB, { namespace, id: targetId });
+    if (!target) return openAiError("Target memory not found", 404);
+    const mergedContent = content || target.content;
+    const updatedTarget = await updateMemory(env.DB, {
+      namespace,
+      id: targetId,
+      patch: {
+        type,
+        content: mergedContent,
+        confidence: Math.max(confidence, target.confidence),
+        importance: Math.max(importance, target.importance),
+        tags,
+        sourceMessageIds
+      }
+    });
+    if (updatedTarget) await syncMemoryEmbeddingBestEffort(env, updatedTarget);
+    const updated = await updateMemoryCandidateStatus(env.DB, {
+      namespace,
+      id,
+      status: "merged",
+      targetMemoryId: targetId,
+      decisionNote: readString(body.decision_note) || "merged"
+    });
+    return json({ data: { candidate: updated ? toCandidateApiRecord(updated) : null, memory: updatedTarget ? toMemoryApiRecord(updatedTarget) : null } });
+  }
+
+  if (action === "supersede") {
+    const oldId = readString(body.target_id);
+    if (!oldId) return openAiError("target_id is required", 400);
+    const result = await supersedeMemory(env, {
+      namespace,
+      oldId,
+      newContent: content,
+      newType: type,
+      newFactKey: factKey,
+      confidence,
+      importance,
+      tags,
+      source: "review",
+      sourceMessageIds,
+      reason: readString(body.decision_note) || "candidate_supersede"
+    });
+    const updated = await updateMemoryCandidateStatus(env.DB, {
+      namespace,
+      id,
+      status: "merged",
+      targetMemoryId: result.newId,
+      decisionNote: readString(body.decision_note) || "superseded"
+    });
+    return json({ data: { candidate: updated ? toCandidateApiRecord(updated) : null, memory_id: result.newId } });
+  }
+
+  return openAiError("Not found", 404);
+}
+
 export async function handleIngestMessagesApi(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const auth = await authenticate(request, env);
   if (!auth.ok) return openAiError("Unauthorized", 401, "authentication_error");
@@ -253,7 +723,7 @@ async function handlePatchMemory(
   if (!body) return openAiError("Request body must be a JSON object", 400);
 
   const namespace = resolveNamespace(profile, body.namespace);
-  const existing = await getVectorMemory(env, id);
+  const existing = await getMemoryById(env.DB, { namespace, id });
   if (!existing || existing.namespace !== namespace) return openAiError("Memory not found", 404);
 
   const patch = {
@@ -270,10 +740,17 @@ async function handlePatchMemory(
     expiresAt: body.expires_at === undefined ? undefined : readOptionalString(body.expires_at)
   };
 
-  const updated = await updateVectorMemory(env, id, patch);
+  const updated = await updateMemory(env.DB, { namespace, id, patch });
+  if (updated) {
+    if (updated.status === "active") {
+      await syncMemoryEmbeddingBestEffort(env, updated);
+    } else {
+      await deleteMemoryEmbeddingBestEffort(env, updated);
+    }
+  }
 
   if (!updated) return openAiError("Memory not found", 404);
-  return json({ data: updated });
+  return json({ data: toMemoryApiRecord(updated) });
 }
 
 async function handleDeleteMemory(
@@ -284,10 +761,11 @@ async function handleDeleteMemory(
   const scopeError = requireScope(profile, "memory:write");
   if (scopeError) return scopeError;
 
-  const existing = await getVectorMemory(env, id);
+  const existing = await getMemoryById(env.DB, { namespace: profile.namespace, id });
   if (!existing || existing.namespace !== profile.namespace) return openAiError("Memory not found", 404);
 
-  await deleteVectorMemory(env, id);
+  const deleted = await softDeleteMemory(env.DB, { namespace: profile.namespace, id });
+  if (deleted) await deleteMemoryEmbeddingBestEffort(env, deleted);
   return json({ data: { id: existing.id, vector_id: existing.vector_id, deleted: true } });
 }
 
@@ -295,10 +773,10 @@ async function handleGetMemory(env: Env, profile: KeyProfile, id: string): Promi
   const scopeError = requireScope(profile, "memory:read");
   if (scopeError) return scopeError;
 
-  const memory = await getVectorMemory(env, id);
+  const memory = await getMemoryById(env.DB, { namespace: profile.namespace, id });
 
   if (!memory || memory.namespace !== profile.namespace) return openAiError("Memory not found", 404);
-  return json({ data: memory });
+  return json({ data: toMemoryApiRecord(memory) });
 }
 
 export async function handleMemories(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -327,6 +805,10 @@ export async function handleMemories(request: Request, env: Env, ctx: ExecutionC
 
   if (tail.length === 1 && tail[0] === "ingest" && request.method === "POST") {
     return handleIngestMemories(request, env, ctx, auth.profile);
+  }
+
+  if (tail.length === 1 && tail[0] === "export" && request.method === "GET") {
+    return handleExportMemories(request, env, auth.profile);
   }
 
   if (tail.length === 1) {

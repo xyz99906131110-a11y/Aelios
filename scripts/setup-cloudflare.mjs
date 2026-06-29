@@ -25,9 +25,7 @@ const queueName = process.env.CMP_QUEUE_NAME || "companion-memory";
 // secrets the same way regardless of whether they live in [vars] or secrets.
 const visibleVarNames = [
   "AI_GATEWAY_BASE_URL",
-  "CLOUDFLARE_ACCOUNT_ID",
   "CHAT_MODEL",
-  "MEMORY_BACKEND",
   "VECTORIZE_INDEX_NAME",
   "ENABLE_MEMORY_RERANKER",
   "MEMORY_FILTER_MODEL",
@@ -42,8 +40,6 @@ const visibleVarNames = [
   "VISION_MODEL",
   "MEMORY_MIN_SCORE",
   "MEMORY_TOP_K",
-  "ENABLE_INCREMENTAL_MEMORY",
-  "ENABLE_DREAM",
   "DREAM_NAMESPACE",
   "DREAM_TIME_ZONE",
   "DREAM_MAX_MESSAGES",
@@ -51,6 +47,12 @@ const visibleVarNames = [
   "DREAM_MAX_TOKENS",
   "DREAM_MEMORY_CONTEXT_LIMIT",
   "DREAM_EXCERPT_LIMIT",
+  "EXTRACT_MODEL",
+  "EXTRACT_MAX_MESSAGES",
+  "EXTRACT_MAX_RUNS",
+  "EXTRACT_MAX_TOKENS",
+  "EXTRACT_REVIEW_CONFIDENCE",
+  "DEDUP_COSINE",
   "ANTHROPIC_THINKING_ENABLED",
   "ANTHROPIC_THINKING_BUDGET",
   "ANTHROPIC_CACHE_ENABLED",
@@ -198,11 +200,14 @@ function ensureVectorize() {
 
   ensureVectorizeBinding();
 
+  // v2: kind 区分 memory | precious | longtail (母帖 #11 第 1 步)。
+  // 没有这个 metadata index，按 kind 过滤会全表扫，接不上召回管线。
   const indexes = [
     ["namespace", "string"],
     ["status", "string"],
     ["type", "string"],
-    ["pinned", "boolean"]
+    ["pinned", "boolean"],
+    ["kind", "string"]
   ];
 
   for (const [propertyName, type] of indexes) {

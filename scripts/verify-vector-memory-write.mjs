@@ -1,0 +1,120 @@
+#!/usr/bin/env node
+/**
+ * Contract test for src/memory/vectorStore.ts D1/Vectorize consistency.
+ *
+ * Vector memory writes must update D1 first, create the lifecycle sidecar row
+ * when v2 is enabled, and only then mirror the record into Vectorize. This
+ * prevents Vectorize-only orphan memories and stale D1 rows from reappearing.
+ *
+ * Run:  node scripts/verify-vector-memory-write.mjs
+ * Exit 0 = all checks passed, exit 1 = failure.
+ */
+
+import { strict as assert } from "node:assert";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, resolve } from "node:path";
+
+const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const source = readFileSync(resolve(root, "src/memory/vectorStore.ts"), "utf8");
+const searchSource = readFileSync(resolve(root, "src/memory/search.ts"), "utf8");
+const digestSource = readFileSync(resolve(root, "src/memory/dailyDigest.ts"), "utf8");
+const recallSource = readFileSync(resolve(root, "src/memory/v2/recall.ts"), "utf8");
+const mcpSource = readFileSync(resolve(root, "src/api/mcp.ts"), "utf8");
+const extractSource = readFileSync(resolve(root, "src/memory/extractPipeline.ts"), "utf8");
+const indexSource = readFileSync(resolve(root, "src/index.ts"), "utf8");
+const wranglerSource = readFileSync(resolve(root, "wrangler.toml"), "utf8");
+const queueProducerSource = readFileSync(resolve(root, "src/queue/producer.ts"), "utf8");
+
+function indexOfOrThrow(haystack, needle) {
+  const index = haystack.indexOf(needle);
+  assert.notEqual(index, -1, `Expected source to contain: ${needle}`);
+  return index;
+}
+
+const createStart = indexOfOrThrow(source, "export async function createVectorMemory");
+const getStart = indexOfOrThrow(source, "export async function getVectorMemory");
+const deleteStart = indexOfOrThrow(source, "export async function deleteVectorMemory");
+const updateStart = indexOfOrThrow(source, "export async function updateVectorMemory");
+const searchStart = indexOfOrThrow(source, "export async function searchVectorMemories");
+const createBody = source.slice(createStart, getStart);
+const getBody = source.slice(getStart, deleteStart);
+const deleteBody = source.slice(deleteStart, updateStart);
+const updateBody = source.slice(updateStart, searchStart);
+
+assert.match(source, /function\s+isLifecycleEnabled\(env: Env\): boolean \{\s*return env\.MEMORY_LIFECYCLE_ENABLED !== "false";\s*\}/s);
+assert.match(source, /INSERT INTO memories \(/);
+assert.match(source, /INSERT OR IGNORE INTO memory_lifecycle \(/);
+assert.match(source, /await env\.DB\.batch\(\[memoryInsert, lifecycleInsert\]\);/);
+assert.match(source, /UPDATE memories SET\s+type = \?, content = \?, summary = \?, importance = \?, confidence = \?, status = \?,/s);
+assert.match(source, /UPDATE memories SET status = 'deleted', updated_at = \? WHERE namespace = \? AND id = \?/);
+
+const d1Insert = indexOfOrThrow(createBody, "await insertMemoryRecord(env, record);");
+const vectorUpsert = indexOfOrThrow(createBody, "await requireVectorize(env).upsert");
+assert.ok(d1Insert < vectorUpsert, "createVectorMemory must write D1 before Vectorize");
+
+assert.match(createBody, /catch \(error\) \{\s*console\.error\("memory vector upsert failed after D1 insert", \{ id, error \}\);\s*\}/s);
+assert.match(createBody, /return memoryRecordToApiRecord\(record\);/);
+assert.match(getBody, /const d1Record = await getMemoryRecordById\(env, id\);\s*return d1Record \? memoryRecordToApiRecord\(d1Record\) : null;/s);
+
+const d1Delete = indexOfOrThrow(deleteBody, "await markMemoryRecordDeleted(env,");
+const vectorDelete = indexOfOrThrow(deleteBody, "await requireVectorize(env).deleteByIds");
+assert.ok(d1Delete < vectorDelete, "deleteVectorMemory must mark D1 deleted before Vectorize delete");
+assert.match(deleteBody, /console\.error\("memory vector delete failed after D1 delete", \{ id, error \}\);/);
+
+const d1Update = indexOfOrThrow(updateBody, "const updatedRecord = await updateMemoryRecord(env, nextRecord);");
+const updateVectorUpsert = indexOfOrThrow(updateBody, "await requireVectorize(env).upsert");
+assert.ok(d1Update < updateVectorUpsert, "updateVectorMemory must update D1 before Vectorize upsert");
+assert.match(updateBody, /console\.error\("memory vector upsert failed after D1 update", \{ id: next\.id, error \}\);/);
+assert.match(updateBody, /return memoryRecordToApiRecord\(updatedRecord\);/);
+
+assert.match(source, /type\?: string;\s+status\?: string;/);
+assert.match(source, /options\?: \{ includeInactive\?: boolean \}/);
+assert.match(source, /const hasFilter = Boolean\(input\.type \|\| input\.status\);/);
+assert.match(source, /ids: data\.map\(\(record\) => record\.id\)/);
+assert.match(source, /if \(input\.type && record\.type !== input\.type\) continue;/);
+assert.match(source, /if \(input\.status && record\.status !== input\.status\) continue;/);
+
+assert.match(searchSource, /function getLegacyFallbackLimit\(env: Env, topK: number\): number/);
+assert.match(searchSource, /function getLegacyFallbackScoreFactor\(env: Env\): number/);
+assert.match(searchSource, /const vectorTopK = Math\.min\(Math\.max\(input\.topK \* 3, input\.topK \+ legacyFallbackLimit\), 100\);/);
+assert.match(searchSource, /const legacySlots = Math\.max\(0, Math\.min\(input\.topK - d1Records\.length, legacyFallbackLimit\)\);/);
+assert.match(searchSource, /score: record\.score \* getLegacyFallbackScoreFactor\(env\)/);
+assert.match(searchSource, /\)\.slice\(0, input\.topK\);/);
+
+assert.match(digestSource, /const summary = \[`【\$\{input\.dateLabel\} 重要原文】`, reason \? `保存原因：\$\{reason\}` : ""\]/);
+assert.match(digestSource, /content: quote,\s+summary,/s);
+assert.match(digestSource, /if \(v2Enabled && strategy !== "legacy"\) \{\s+const page = await listMemoriesPage\(env\.DB,/s);
+
+assert.match(recallSource, /function readRecallMinScore\(env: Env, override\?: number\): number/);
+assert.match(recallSource, /RECALL_MIN_SCORE \?\? 0\.15/);
+assert.match(recallSource, /min_score\?: number;/);
+assert.match(recallSource, /floored_ids: string\[\];\s+floored_count: number;\s+min_score: number;/);
+assert.match(recallSource, /const minScore = readRecallMinScore\(env, input\.min_score\);/);
+assert.match(recallSource, /const beforeFloor = \[\.\.\.afterDedup, \.\.\.longtailHits\]/);
+assert.match(recallSource, /if \(hit\.score >= minScore\) return true;\s+flooredIds\.push\(hit\.id\);/s);
+assert.match(recallSource, /floored_ids: flooredIds,\s+floored_count: flooredIds\.length,\s+min_score: minScore,/s);
+assert.match(mcpSource, /min_score: \{ type: "number", minimum: 0, maximum: 1 \}/);
+assert.match(mcpSource, /min_score: typeof args\.min_score === "number" \? readNumber\(args\.min_score, 0\.15\) : undefined/);
+assert.match(wranglerSource, /crons = \["0 \*\/4 \* \* \*", "10 20 \* \* \*"\]/);
+assert.match(wranglerSource, /EXTRACT_MODEL = "deepseek\/deepseek-v4-flash"/);
+assert.match(wranglerSource, /DEDUP_COSINE = "0\.9"/);
+assert.match(indexSource, /const EXTRACT_CRON = "0 \*\/4 \* \* \*"/);
+assert.match(indexSource, /runMemoryExtractionBatches\(env, namespace, \{ scheduledTime: controller\.scheduledTime \}\)/);
+assert.match(queueProducerSource, /if \(isV2Enabled\(env\)\) return;/);
+assert.match(extractSource, /const DEFAULT_EXTRACT_MODEL = "deepseek\/deepseek-v4-flash"/);
+assert.match(extractSource, /const DEFAULT_DEDUP_COSINE = 0\.9/);
+assert.match(extractSource, /function cosineSimilarity\(a: number\[\], b: number\[\]\): number/);
+assert.match(extractSource, /async function isSameFactByEmbedding/);
+assert.match(extractSource, /function previousWindowStartIso\(endIso: string\): string/);
+assert.match(extractSource, /const startIso = cursor \?\? previousWindowStartIso\(endIso\);/);
+assert.match(extractSource, /getActiveMemoryByFactKey\(env\.DB, \{ namespace: input\.namespace, factKey \}\)/);
+assert.match(extractSource, /await isSameFactByEmbedding\(env, \{/);
+assert.match(extractSource, /await supersedeMemory\(env, \{/);
+assert.match(extractSource, /findEmbeddingDuplicate\(env,/);
+assert.match(readFileSync(resolve(root, "src/db/v2.ts"), "utf8"), /await db\.batch\(\[ensureLifecycle, markSeen\]\);/);
+assert.match(digestSource, /v2 首次抽取由每 4 小时 extractor 负责/);
+assert.doesNotMatch(digestSource, /for \(const memory of digest\.memories_to_add \?\? \[\]\) \{\s+const factKey/s);
+assert.doesNotMatch(digestSource, /added \+= 0/);
+
+console.log("verify-vector-memory-write: all checks passed");

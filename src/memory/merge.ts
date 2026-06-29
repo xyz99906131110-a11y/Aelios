@@ -1,3 +1,4 @@
+import { upsertMemoryByFactKey } from "../db/v2";
 import { createMemory, getMemoryById, updateMemory } from "../db/memories";
 import { callOpenAICompat } from "../proxy/openaiAdapter";
 import type { Env, MemoryApiRecord, MemoryRecord, OpenAIChatRequest, OpenAIChatResponse } from "../types";
@@ -329,4 +330,21 @@ export async function persistMemoryWithMerge(
   }
 
   return createNewMemory(env, input);
+}
+
+export async function persistMemoryWithFactKey(
+  env: Env,
+  input: PersistMemoryInput & { factKey: string }
+): Promise<{ id: string; created: boolean }> {
+  return upsertMemoryByFactKey(env, {
+    namespace: input.namespace,
+    factKey: input.factKey,
+    content: input.memory.content,
+    type: input.memory.type,
+    importance: input.memory.importance,
+    confidence: input.memory.confidence,
+    tags: input.memory.tags,
+    source: input.source,
+    sourceMessageIds: input.sourceMessageIds
+  });
 }

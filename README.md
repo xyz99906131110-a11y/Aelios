@@ -229,11 +229,11 @@ https://<你的 Worker 地址>/mcp?token=<MEMORY_MCP_API_KEY>
 | `MEMORY_FILTER_MIN_SCORE` | `0.1` | 进 reranker 前的向量地板，同样保持低 |
 | `MEMORY_FILTER_MAX_CONTENT_CHARS` | `700` | 候选记忆每条最多保留多少字 |
 | `MEMORY_MIN_IMPORTANCE` | `0.55` | 记忆写入最低重要性 |
-| `MEMORY_BACKEND` | `vectorize` | 长期记忆主库（设 `d1` 回旧模式） |
 | `VECTORIZE_INDEX_NAME` | `memo-kb` | Vectorize 索引名 |
 | `ENABLE_AUTO_MEMORY` | 空（开启） | 设 `false` 关闭自动记忆 |
-| `ENABLE_INCREMENTAL_MEMORY` | `false` | 设 `true` 恢复每轮即时抽取 |
-| `ENABLE_DREAM` | `true` | 夜间整理开关 |
+| `EXTRACT_MODEL` | `deepseek/deepseek-v4-flash` | 每 4 小时小批抽取模型 |
+| `EXTRACT_REVIEW_CONFIDENCE` | `0.76` | 低于此置信度先进入候选审核 |
+| `DEDUP_COSINE` | `0.9` | embedding 判重阈值 |
 | `DREAM_TIME_ZONE` | `Asia/Singapore` | 按此时区切自然日 |
 | `DREAM_MAX_MESSAGES` | `40` | 每次 dream 最多处理消息数 |
 | `DREAM_MAX_RUNS` | `10` | 每次定时任务最多连续 dream 批数 |
@@ -246,6 +246,9 @@ https://<你的 Worker 地址>/mcp?token=<MEMORY_MCP_API_KEY>
 | `DEBUG_API_KEY` | 空 | 调试接口钥匙 |
 | `MEMORY_MCP_API_KEY` | 空 | 纯记忆库 MCP 单独钥匙 |
 | `GUIDE_DOG_API_KEY` | 空 | 导盲犬 API 单独钥匙 |
+
+记忆库默认走 v2：冷启动包 + 动态召回 + 4 小时抽取 + 候选审核 + 凌晨整理。
+兼容/回退开关默认隐藏，不需要在 Cloudflare Variables 里手动配置。
 
 ---
 
@@ -328,17 +331,16 @@ workers-ai/@cf/... → env.AI.run（不走 AI Gateway）
 
 ```
 保存 messages 到 D1 → 默认不即时抽取
+→ 每 4 小时用 EXTRACT_MODEL 小批抽取稳定事实
+  ├─ fact_key 撞键走 supersede / mark-seen
+  ├─ 无 fact_key 按 DEDUP_COSINE 做 embedding 判重
+  └─ 低置信度先进入候选审核队列
 → 每天 04:10 (DREAM_TIME_ZONE) 触发 scheduled dream
-  ├─ 只读昨天自然日的原始聊天
-  ├─ 按 DREAM_MAX_MESSAGES 分批，最多 DREAM_MAX_RUNS 批
-  ├─ 读取旧 active 记忆参考
-  ├─ 清理空/短记忆
-  ├─ DREAM_MODEL 新增高质量长期记忆 + 保存重要原文摘录
+  ├─ 重写 L1 摘要和昨日日志
   ├─ 合并重复、替换过时、更新冲突
+  ├─ 保存重要原文摘录
   └─ 原始 messages 只保留 3 天
 ```
-
-恢复每轮即时抽取：`ENABLE_INCREMENTAL_MEMORY=true`
 
 **清理（后台 Queue，24h 节流）：**
 
