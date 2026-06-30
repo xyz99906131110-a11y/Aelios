@@ -103,8 +103,15 @@ export async function handleChatCompletions(
   const namespace = auth.profile.namespace;
   const lastUserText = extractLastUserText(body.messages);
 
-  const boot = isV2Enabled(env) ? await buildBootPackage(env, { namespace }) : null;
-  const recallResult = boot ? await runRecall(env, { namespace, query: lastUserText }) : null;
+  let boot: any = null;
+let recallResult: any = null;
+try {
+  boot = isV2Enabled(env) ? await buildBootPackage(env, { namespace }) : null;
+  recallResult = boot ? await runRecall(env, { namespace, query: lastUserText }) : null;
+} catch (recallError) {
+  console.error("recall pipeline error", recallError);
+  return openAiError(`Recall error: ${recallError instanceof Error ? recallError.message : String(recallError)} | stack: ${recallError instanceof Error ? recallError.stack : ""}`, 500);
+}
   const recallHitsAsMemories = recallResult
     ? recallResult.hits.map((h) => ({
         id: h.id,
