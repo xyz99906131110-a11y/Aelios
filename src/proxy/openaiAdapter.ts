@@ -31,8 +31,24 @@ export function buildOpenAIRequestFromAssembled(
   return buildOpenAICompatRequest({ ...req, messages }, targetModel);
 }
 
+/**
+ * Detect whether AI_GATEWAY_BASE_URL points to Cloudflare AI Gateway.
+ * If not, we treat it as a direct upstream (e.g. opencode) and skip the
+ * /compat path prefix.
+ */
+function isCloudflareAiGateway(env: Env): boolean {
+  const base = env.AI_GATEWAY_BASE_URL || "";
+  return base.includes("gateway.ai.cloudflare.com");
+}
+
 export function getOpenAICompatUrl(env: Env): string {
-  return `${normalizeAiGatewayBaseUrl(env)}/compat/chat/completions`;
+  const base = normalizeAiGatewayBaseUrl(env);
+  // If going through Cloudflare AI Gateway, use /compat/chat/completions
+  // If direct upstream (opencode etc.), use /chat/completions directly
+  if (isCloudflareAiGateway(env)) {
+    return `${base}/compat/chat/completions`;
+  }
+  return `${base}/chat/completions`;
 }
 
 export function normalizeAiGatewayBaseUrl(env: Env): string {
@@ -40,7 +56,6 @@ export function normalizeAiGatewayBaseUrl(env: Env): string {
   if (!base) {
     throw new Error("Missing AI_GATEWAY_BASE_URL");
   }
-
   return base
     .replace(/\/+$/, "")
     .replace(/\/compat$/i, "")
@@ -53,11 +68,14 @@ export function buildOpenAICompatHeaders(env: Env): Headers {
   const headers = new Headers({
     "content-type": "application/json"
   });
-
   if (env.CF_AIG_TOKEN) {
     headers.set("cf-aig-authorization", `Bearer ${env.CF_AIG_TOKEN}`);
   }
-
+  // If not going through Cloudflare AI Gateway and UPSTREAM_API_KEY exists,
+  // add Authorization header for direct upstream authentication
+  if (!isCloudflareAiGateway(env) && env.UPSTREAM_API_KEY) {
+    headers.set("authorization", `Bearer ${env.UPSTREAM_API_KEY}`);
+  }
   return headers;
 }
 
@@ -77,7 +95,6 @@ export async function callOpenAICompatEmbeddings(
   if (body.model.startsWith("workers-ai/") && env.CLOUDFLARE_API_TOKEN) {
     headers.set("authorization", `Bearer ${env.CLOUDFLARE_API_TOKEN}`);
   }
-
   return fetch(`${normalizeAiGatewayBaseUrl(env)}/compat/embeddings`, {
     method: "POST",
     headers,
