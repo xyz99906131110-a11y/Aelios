@@ -212,7 +212,7 @@ async function searchWithVectorize(
   if (!vector) return null;
 
   const legacyFallbackLimit = getLegacyFallbackLimit(env, input.topK);
-  const vectorTopK = Math.min(Math.max(input.topK * 3, input.topK + legacyFallbackLimit), 100);
+  const vectorTopK = Math.min(Math.max(input.topK * 3, input.topK + legacyFallbackLimit), 50);
   const vectorInput = { ...input, topK: vectorTopK };
   let result = await queryVectorize(env, vector, vectorInput, true);
   let usedUnfilteredFallback = false;
