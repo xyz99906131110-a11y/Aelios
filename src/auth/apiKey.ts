@@ -6,6 +6,9 @@ function getBearerToken(request: Request): string | null {
   if (auth?.toLowerCase().startsWith("bearer ")) {
     return auth.slice("bearer ".length).trim();
   }
+  const url = new URL(request.url);
+  const queryToken = url.searchParams.get("token");
+  if (queryToken) return queryToken;
   return request.headers.get("x-api-key");
 }
 
