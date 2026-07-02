@@ -82,10 +82,11 @@ export async function handleChatCompletions(
     targetModel = env.VISION_MODEL;
   } else {
     targetModel = env.CHAT_MODEL || "glm-5.2";
+    body.model = targetModel;
   }
 
   const provider = classifyProvider(targetModel);
-
+  
   const conversation = await getOrCreateConversation(env.DB, {
     namespace: auth.profile.namespace
   });
