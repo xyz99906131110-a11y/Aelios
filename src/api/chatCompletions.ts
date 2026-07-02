@@ -77,9 +77,11 @@ export async function handleChatCompletions(
     return openAiError(message, 500);
   }
 
-  if (hasImageContent(body)) {
+    if (hasImageContent(body)) {
     if (!env.VISION_MODEL) return openAiError("Missing VISION_MODEL", 500);
     targetModel = env.VISION_MODEL;
+  } else {
+    targetModel = env.CHAT_MODEL || "glm-5.2";
   }
 
   const provider = classifyProvider(targetModel);
